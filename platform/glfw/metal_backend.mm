@@ -1,7 +1,7 @@
 #include "metal_backend.h"
 
-#include <mbgl/mtl/mtl_fwd.hpp>
-#include <mbgl/mtl/renderable_resource.hpp>
+#include <mln/mtl/mtl_fwd.hpp>
+#include <mln/mtl/renderable_resource.hpp>
 
 #include <Metal/Metal.hpp>
 #include <QuartzCore/CAMetalLayer.hpp>
@@ -19,14 +19,11 @@ public:
     swapchain->setDevice(backend.getDevice().get());
   }
 
-  void setBackendSize(mln::Size size_) {
-    size = size_;
+  void setDrawableSize(const mln::Size& drawableSize) {
     swapchain->setDrawableSize(
-        {static_cast<CGFloat>(size.width), static_cast<CGFloat>(size.height)});
+        {static_cast<CGFloat>(drawableSize.width), static_cast<CGFloat>(drawableSize.height)});
     buffersInvalid = true;
   }
-
-  mln::Size getSize() const { return size; }
 
   void bind() override {
     surface = NS::TransferPtr(swapchain->nextDrawable());
@@ -107,7 +104,6 @@ private:
   CAMetalLayerPtr swapchain;
   gfx::Texture2DPtr depthTexture;
   gfx::Texture2DPtr stencilTexture;
-  mln::Size size;
   bool buffersInvalid = true;
 };
 
@@ -127,12 +123,8 @@ mln::gfx::Renderable& MetalBackend::getDefaultRenderable() { return *this; }
 
 void MetalBackend::activate() {}
 void MetalBackend::deactivate() {}
-void MetalBackend::updateAssumedState() {}
 
 void MetalBackend::setSize(mln::Size size_) {
-  getResource<mln::MetalRenderableResource>().setBackendSize(size_);
-}
-
-mln::Size MetalBackend::getSize() const {
-  return getResource<mln::MetalRenderableResource>().getSize();
+  setRenderableSize(size_);
+  getResource<mln::MetalRenderableResource>().setDrawableSize(size_);
 }

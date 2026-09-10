@@ -1,8 +1,8 @@
 #import "MLNMapView+Impl.h"
 #import "MLNMapView_Private.h"
 
-#include <mbgl/gfx/renderable.hpp>
-#include <mbgl/mtl/renderer_backend.hpp>
+#include <mln/gfx/renderable.hpp>
+#include <mln/mtl/renderer_backend.hpp>
 
 @class MLNMapViewImplDelegate;
 
@@ -25,11 +25,6 @@ private:
   void activate() override;
   void deactivate() override;
   // End implementation of mln::gfx::RendererBackend
-
-  // Implementation of mln::gl::RendererBackend
-public:
-  void updateAssumedState() override;
-  // End implementation of mln::gl::Rendererbackend
 
   // Implementation of MLNMapViewImpl
 public:

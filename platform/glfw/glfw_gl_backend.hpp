@@ -2,8 +2,8 @@
 
 #include "glfw_backend.hpp"
 
-#include <mbgl/gfx/renderable.hpp>
-#include <mbgl/gl/renderer_backend.hpp>
+#include <mln/gfx/renderable.hpp>
+#include <mln/gl/renderer_backend.hpp>
 
 struct GLFWwindow;
 
@@ -17,8 +17,8 @@ public:
     // GLFWRendererBackend implementation
 public:
     mln::gfx::RendererBackend& getRendererBackend() override { return *this; }
-    mln::Size getSize() const override;
-    void setSize(mln::Size) override;
+    mln::Size getFramebufferSize() const override;
+    void setFramebufferSize(mln::Size) override;
 
     // mln::gfx::RendererBackend implementation
 public:

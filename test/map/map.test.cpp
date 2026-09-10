@@ -1,47 +1,47 @@
 #include <gmock/gmock.h>
 
-#include <mbgl/test/util.hpp>
-#include <mbgl/test/stub_file_source.hpp>
-#include <mbgl/test/stub_map_observer.hpp>
-#include <mbgl/test/fake_file_source.hpp>
-#include <mbgl/test/fixture_log_observer.hpp>
-#include <mbgl/test/map_adapter.hpp>
+#include <mln/test/util.hpp>
+#include <mln/test/stub_file_source.hpp>
+#include <mln/test/stub_map_observer.hpp>
+#include <mln/test/fake_file_source.hpp>
+#include <mln/test/fixture_log_observer.hpp>
+#include <mln/test/map_adapter.hpp>
 
-#include <mbgl/gfx/backend_scope.hpp>
-#include <mbgl/gfx/headless_frontend.hpp>
-#include <mbgl/gfx/shader_registry.hpp>
-#include <mbgl/map/map_options.hpp>
-#include <mbgl/math/log2.hpp>
-#include <mbgl/renderer/renderer.hpp>
-#include <mbgl/renderer/update_parameters.hpp>
-#include <mbgl/storage/file_source_manager.hpp>
-#include <mbgl/storage/main_resource_loader.hpp>
-#include <mbgl/storage/network_status.hpp>
-#include <mbgl/storage/online_file_source.hpp>
-#include <mbgl/storage/resource_options.hpp>
-#include <mbgl/style/expression/dsl.hpp>
-#include <mbgl/style/image_impl.hpp>
-#include <mbgl/style/image.hpp>
-#include <mbgl/style/layers/background_layer.hpp>
-#include <mbgl/style/layers/background_layer.hpp>
-#include <mbgl/style/layers/fill_layer.hpp>
-#include <mbgl/style/layers/line_layer.hpp>
-#include <mbgl/style/layers/raster_layer.hpp>
-#include <mbgl/style/layers/symbol_layer.hpp>
-#include <mbgl/style/sources/custom_geometry_source.hpp>
-#include <mbgl/style/sources/geojson_source.hpp>
-#include <mbgl/style/sources/image_source.hpp>
-#include <mbgl/style/sources/vector_source.hpp>
-#include <mbgl/style/style_impl.hpp>
-#include <mbgl/style/style.hpp>
-#include <mbgl/util/async_task.hpp>
-#include <mbgl/util/client_options.hpp>
-#include <mbgl/util/color.hpp>
-#include <mbgl/util/image.hpp>
-#include <mbgl/util/geo.hpp>
-#include <mbgl/util/io.hpp>
-#include <mbgl/util/logging.hpp>
-#include <mbgl/util/run_loop.hpp>
+#include <mln/gfx/backend_scope.hpp>
+#include <mln/gfx/headless_frontend.hpp>
+#include <mln/gfx/shader_registry.hpp>
+#include <mln/map/map_options.hpp>
+#include <mln/math/log2.hpp>
+#include <mln/renderer/renderer.hpp>
+#include <mln/renderer/update_parameters.hpp>
+#include <mln/storage/file_source_manager.hpp>
+#include <mln/storage/main_resource_loader.hpp>
+#include <mln/storage/network_status.hpp>
+#include <mln/storage/online_file_source.hpp>
+#include <mln/storage/resource_options.hpp>
+#include <mln/style/expression/dsl.hpp>
+#include <mln/style/image_impl.hpp>
+#include <mln/style/image.hpp>
+#include <mln/style/layers/background_layer.hpp>
+#include <mln/style/layers/background_layer.hpp>
+#include <mln/style/layers/fill_layer.hpp>
+#include <mln/style/layers/line_layer.hpp>
+#include <mln/style/layers/raster_layer.hpp>
+#include <mln/style/layers/symbol_layer.hpp>
+#include <mln/style/sources/custom_geometry_source.hpp>
+#include <mln/style/sources/geojson_source.hpp>
+#include <mln/style/sources/image_source.hpp>
+#include <mln/style/sources/vector_source.hpp>
+#include <mln/style/style_impl.hpp>
+#include <mln/style/style.hpp>
+#include <mln/util/async_task.hpp>
+#include <mln/util/client_options.hpp>
+#include <mln/util/color.hpp>
+#include <mln/util/image.hpp>
+#include <mln/util/geo.hpp>
+#include <mln/util/io.hpp>
+#include <mln/util/logging.hpp>
+#include <mln/util/run_loop.hpp>
 
 #include <atomic>
 
@@ -2038,4 +2038,77 @@ TEST(Map, SetFrustumOffset) {
     test.map.setFrustumOffset(EdgeInsets{50, 50, 50, 50});
 
     test::checkImage("test/fixtures/map/setFrustumOffset/after", test.frontend.render(test.map).image, 0.0006, 0.1);
+}
+
+// End-to-end: a feature-state change must alter the *rendered* output, not just
+// the value read back through the API. A fill covering the viewport is colored
+// by a data-driven expression on feature-state "active" (blue by default, red
+// when set), and we sample the centre pixel of the rendered frame after each
+// change. This exercises the full path: setFeatureState -> coalesce during
+// prepare -> data-driven paint re-evaluation -> pixels.
+TEST(Map, FeatureStateChangesRenderedStyle) {
+    MapTest<> test;
+
+    test.map.getStyle().loadJSON(R"STYLE({
+      "version": 8,
+      "sources": {
+        "fs": {
+          "type": "geojson",
+          "data": {
+            "type": "Feature",
+            "id": 1,
+            "properties": {},
+            "geometry": {
+              "type": "Polygon",
+              "coordinates": [[[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]]]
+            }
+          }
+        }
+      },
+      "layers": [{
+        "id": "fill",
+        "type": "fill",
+        "source": "fs",
+        "paint": {
+          "fill-color": ["case", ["boolean", ["feature-state", "active"], false], "#ff0000", "#0000ff"]
+        }
+      }]
+    })STYLE");
+
+    test.map.jumpTo(CameraOptions().withCenter(LatLng{0, 0}).withZoom(0.0));
+
+    auto* renderer = test.frontend.getRenderer();
+
+    // Reads one channel (0=R, 1=G, 2=B) of the centre pixel
+    const auto centerChannel = [](const PremultipliedImage& image, size_t channel) -> int {
+        const size_t x = image.size.width / 2;
+        const size_t y = image.size.height / 2;
+        return image.data.get()[y * image.stride() + x * image.channels + channel];
+    };
+
+    // Default state: the fill renders blue
+    {
+        const auto result = test.frontend.render(test.map);
+        EXPECT_LT(centerChannel(result.image, 0), 40) << "red channel (default)";
+        EXPECT_GT(centerChannel(result.image, 2), 200) << "blue channel (default)";
+    }
+
+    // Setting feature-state "active" flips the rendered fill to red on the next
+    // frame, with no style edit
+    FeatureState active;
+    active["active"] = true;
+    renderer->setFeatureState("fs", {}, "1", active);
+    {
+        const auto result = test.frontend.render(test.map);
+        EXPECT_GT(centerChannel(result.image, 0), 200) << "red channel (active)";
+        EXPECT_LT(centerChannel(result.image, 2), 40) << "blue channel (active)";
+    }
+
+    // Removing the state reverts the rendered fill to blue.
+    renderer->removeFeatureState("fs", {}, std::optional<std::string>("1"), {});
+    {
+        const auto result = test.frontend.render(test.map);
+        EXPECT_LT(centerChannel(result.image, 0), 40) << "red channel (removed)";
+        EXPECT_GT(centerChannel(result.image, 2), 200) << "blue channel (removed)";
+    }
 }

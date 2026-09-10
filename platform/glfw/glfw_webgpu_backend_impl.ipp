@@ -1,13 +1,13 @@
 #include "glfw_webgpu_backend.hpp"
 
-#include <mbgl/util/logging.hpp>
-#include <mbgl/util/string.hpp>
-#include <mbgl/gfx/backend_scope.hpp>
-#include <mbgl/webgpu/renderer_backend.hpp>
-#include <mbgl/webgpu/renderable_resource.hpp>
-#include <mbgl/webgpu/context.hpp>
-#include <mbgl/webgpu/command_encoder.hpp>
-#include <mbgl/gfx/renderable.hpp>
+#include <mln/util/logging.hpp>
+#include <mln/util/string.hpp>
+#include <mln/gfx/backend_scope.hpp>
+#include <mln/webgpu/renderer_backend.hpp>
+#include <mln/webgpu/renderable_resource.hpp>
+#include <mln/webgpu/context.hpp>
+#include <mln/webgpu/command_encoder.hpp>
+#include <mln/gfx/renderable.hpp>
 
 #include <GLFW/glfw3.h>
 
@@ -896,13 +896,13 @@ void GLFWWebGPUBackend::deactivate() {
     // WebGPU doesn't need explicit context deactivation like OpenGL
 }
 
-mln::Size GLFWWebGPUBackend::getSize() const {
-    return size;
+mln::Size GLFWWebGPUBackend::getFramebufferSize() const {
+    return getSize();
 }
 
-void GLFWWebGPUBackend::setSize(mln::Size newSize) {
+void GLFWWebGPUBackend::setFramebufferSize(mln::Size newSize) {
     // Update swap chain size if needed
-    if (size != newSize) {
+    if (getSize() != newSize) {
 #ifdef __APPLE__
         int width = 0;
         int height = 0;
@@ -918,7 +918,7 @@ void GLFWWebGPUBackend::setSize(mln::Size newSize) {
             }
         }
 #endif
-        size = newSize;
+        setRenderableSize(newSize);
         surfaceNeedsReconfigure = true;
     }
 }
@@ -1066,10 +1066,6 @@ void* GLFWWebGPUBackend::getCurrentTextureView() {
 #endif
 }
 
-mln::Size GLFWWebGPUBackend::getFramebufferSize() const {
-    return getSize();
-}
-
 void* GLFWWebGPUBackend::getDepthStencilView() {
     std::lock_guard<SpinLock> guard(textureStateLock);
     if (!depthStencilView) {
@@ -1126,7 +1122,8 @@ void GLFWWebGPUBackend::reconfigureSurface() {
         return;
     }
 
-    size = {static_cast<uint32_t>(std::max(width, 0)), static_cast<uint32_t>(std::max(height, 0))};
+    setRenderableSize(
+        {static_cast<uint32_t>(std::max(width, 0)), static_cast<uint32_t>(std::max(height, 0))});
 
     // Configure surface
     wgpu::SurfaceConfiguration config = {};

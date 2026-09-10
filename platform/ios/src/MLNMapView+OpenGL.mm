@@ -2,7 +2,7 @@
 #import "MLNLoggingConfiguration_Private.h"
 #import "MLNMapView+OpenGL.h"
 
-#include <mbgl/gl/renderable_resource.hpp>
+#include <mln/gl/renderable_resource.hpp>
 
 #import <GLKit/GLKit.h>
 #import <OpenGLES/EAGL.h>
@@ -241,8 +241,8 @@ UIImage* MLNMapViewOpenGLImpl::snapshot() {
 
 void MLNMapViewOpenGLImpl::layoutChanged() {
   const auto scaleFactor = contentScaleFactor();
-  size = {static_cast<uint32_t>(mapView.bounds.size.width * scaleFactor),
-          static_cast<uint32_t>(mapView.bounds.size.height * scaleFactor)};
+  setRenderableSize({static_cast<uint32_t>(mapView.bounds.size.width * scaleFactor),
+                     static_cast<uint32_t>(mapView.bounds.size.height * scaleFactor)});
 }
 
 EAGLContext* MLNMapViewOpenGLImpl::getEAGLContext() {

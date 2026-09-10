@@ -1,5 +1,5 @@
-#include <mbgl/gl/headless_backend.hpp>
-#include <mbgl/util/logging.hpp>
+#include <mln/gl/headless_backend.hpp>
+#include <mln/util/logging.hpp>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Foundation/NSString.h>
@@ -51,7 +51,7 @@ public:
   ~CGLDisplayConfig() {
     const CGLError error = CGLDestroyPixelFormat(pixelFormat);
     if (error != kCGLNoError) {
-      Log::Error(Event::OpenGL,
+      Log::Error(Event::GraphicsBackend,
                  std::string("Error destroying pixel format:") + CGLErrorString(error));
     }
   }

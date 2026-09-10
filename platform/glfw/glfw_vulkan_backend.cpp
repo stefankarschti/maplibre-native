@@ -1,8 +1,8 @@
 #include "glfw_vulkan_backend.hpp"
 
-#include <mbgl/gfx/backend_scope.hpp>
-#include <mbgl/vulkan/renderable_resource.hpp>
-#include <mbgl/vulkan/context.hpp>
+#include <mln/gfx/backend_scope.hpp>
+#include <mln/vulkan/renderable_resource.hpp>
+#include <mln/vulkan/context.hpp>
 
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -156,12 +156,12 @@ GLFWVulkanBackend::GLFWVulkanBackend(GLFWwindow* window_, const bool capFrameRat
 
 GLFWVulkanBackend::~GLFWVulkanBackend() {}
 
-mln::Size GLFWVulkanBackend::getSize() const {
-    return size;
+mln::Size GLFWVulkanBackend::getFramebufferSize() const {
+    return getSize();
 }
 
-void GLFWVulkanBackend::setSize(const mln::Size newSize) {
-    size = newSize;
+void GLFWVulkanBackend::setFramebufferSize(const mln::Size newSize) {
+    setRenderableSize(newSize);
 
     auto& contextImpl = static_cast<mln::vulkan::Context&>(*context);
     contextImpl.requestSurfaceUpdate();

@@ -1,10 +1,10 @@
 #pragma once
 
 #include "glfw_backend.hpp"
-#include <mbgl/webgpu/renderer_backend.hpp>
-#include <mbgl/webgpu/context.hpp>
-#include <mbgl/gfx/renderable.hpp>
-#include <mbgl/gfx/renderer_backend.hpp>
+#include <mln/webgpu/renderer_backend.hpp>
+#include <mln/webgpu/context.hpp>
+#include <mln/gfx/renderable.hpp>
+#include <mln/gfx/renderer_backend.hpp>
 #include <memory>
 #include <webgpu/webgpu_cpp.h>
 #include <queue>
@@ -34,8 +34,8 @@ public:
     // GLFWBackend implementation
 public:
     mln::gfx::RendererBackend& getRendererBackend() override;
-    mln::Size getSize() const override;
-    void setSize(mln::Size) override;
+    mln::Size getFramebufferSize() const override;
+    void setFramebufferSize(mln::Size) override;
 
     // mln::gfx::RendererBackend implementation
 public:
@@ -50,7 +50,6 @@ public:
     // Override virtual methods from RendererBackend
     void* getCurrentTextureView() override;
     void* getDepthStencilView() override;
-    mln::Size getFramebufferSize() const override;
 
 private:
     class SpinLock {

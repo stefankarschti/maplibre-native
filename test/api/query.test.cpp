@@ -1,19 +1,19 @@
-#include <mbgl/test/map_adapter.hpp>
+#include <mln/test/map_adapter.hpp>
 
-#include <mbgl/map/map_options.hpp>
-#include <mbgl/test/stub_file_source.hpp>
-#include <mbgl/test/util.hpp>
-#include <mbgl/util/image.hpp>
-#include <mbgl/util/io.hpp>
-#include <mbgl/util/run_loop.hpp>
-#include <mbgl/style/layers/symbol_layer.hpp>
-#include <mbgl/style/style.hpp>
-#include <mbgl/style/image.hpp>
-#include <mbgl/style/source.hpp>
-#include <mbgl/style/sources/geojson_source.hpp>
-#include <mbgl/style/expression/dsl.hpp>
-#include <mbgl/renderer/renderer.hpp>
-#include <mbgl/gfx/headless_frontend.hpp>
+#include <mln/map/map_options.hpp>
+#include <mln/test/stub_file_source.hpp>
+#include <mln/test/util.hpp>
+#include <mln/util/image.hpp>
+#include <mln/util/io.hpp>
+#include <mln/util/run_loop.hpp>
+#include <mln/style/layers/symbol_layer.hpp>
+#include <mln/style/style.hpp>
+#include <mln/style/image.hpp>
+#include <mln/style/source.hpp>
+#include <mln/style/sources/geojson_source.hpp>
+#include <mln/style/expression/dsl.hpp>
+#include <mln/renderer/renderer.hpp>
+#include <mln/gfx/headless_frontend.hpp>
 
 using namespace mln;
 using namespace mln::style;
@@ -153,6 +153,44 @@ TEST(Query, QuerySourceFeatureStates) {
     ASSERT_EQ(states["hover"], true);
     ASSERT_EQ(states["radius"].get<uint64_t>(), 20u);
     ASSERT_EQ(newState, states);
+}
+
+TEST(Query, RemoveSourceFeatureState) {
+    QueryTest test;
+    auto* renderer = test.frontend.getRenderer();
+
+    // Set two state values on a feature. Updates are visible immediately,
+    // without waiting for a render pass.
+    FeatureState newState;
+    newState["hover"] = true;
+    newState["radius"].set<uint64_t>(20);
+    renderer->setFeatureState("source1", {}, "feature1", newState);
+
+    // Read back with the out-parameter overload.
+    FeatureState afterSet;
+    renderer->getFeatureState(afterSet, "source1", {}, "feature1");
+    ASSERT_EQ(afterSet, newState);
+
+    // Remove a single key. Unlike updates, removals are only reflected once a
+    // render pass has coalesced the pending changes into the source state, so
+    // render before reading back.
+    renderer->removeFeatureState("source1", {}, "feature1"s, "hover"s);
+    test.frontend.render(test.map);
+
+    // Read back with the return-value overload.
+    const FeatureState afterKeyRemoval = renderer->getFeatureState("source1", {}, "feature1");
+    ASSERT_EQ(afterKeyRemoval.size(), 1u);
+    ASSERT_EQ(afterKeyRemoval.count("hover"), 0u);
+    ASSERT_EQ(afterKeyRemoval.at("radius").get<uint64_t>(), 20u);
+
+    // Removing the whole feature (no state key) clears any remaining state.
+    renderer->removeFeatureState("source1", {}, "feature1"s, {});
+    test.frontend.render(test.map);
+
+    // Read back with the out-parameter overload again.
+    FeatureState afterFeatureRemoval;
+    renderer->getFeatureState(afterFeatureRemoval, "source1", {}, "feature1");
+    ASSERT_TRUE(afterFeatureRemoval.empty());
 }
 
 TEST(Query, QuerySourceFeaturesOptionValidation) {

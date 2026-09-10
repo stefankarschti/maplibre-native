@@ -2,8 +2,8 @@
 
 #include "glfw_backend.hpp"
 
-#include <mbgl/vulkan/renderable_resource.hpp>
-#include <mbgl/vulkan/renderer_backend.hpp>
+#include <mln/vulkan/renderable_resource.hpp>
+#include <mln/vulkan/renderer_backend.hpp>
 
 // Example of using an application side VkInstance/VkDevice
 // that's shared with MapLibre's renderer backend
@@ -23,8 +23,8 @@ public:
     // GLFWRendererBackend implementation
 public:
     mln::gfx::RendererBackend& getRendererBackend() override { return *this; }
-    mln::Size getSize() const override;
-    void setSize(mln::Size) override;
+    mln::Size getFramebufferSize() const override;
+    void setFramebufferSize(mln::Size) override;
 
     // mln::gfx::RendererBackend implementation
 public:

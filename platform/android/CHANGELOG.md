@@ -1,5 +1,33 @@
 # Changelog MapLibre Native for Android
 
+## 13.6.1
+
+### 🐞 Bug fixes
+
+- keep digits and short codes upright in CJK line labels ([#4566](https://github.com/maplibre/maplibre-native/pull/4566))
+- fix(core): break a label before a left parenthesis, not after it ([#4553](https://github.com/maplibre/maplibre-native/pull/4553))
+- fix(core): Fix missing symbols/glyphs ([#4554](https://github.com/maplibre/maplibre-native/pull/4554))
+- fix(core): Sync image transition based on layout ([#4540](https://github.com/maplibre/maplibre-native/pull/4540))
+
+## 13.6.0
+
+### ✨ Features and improvements
+
+- core: rename `mbgl` directories to `mln` ([#4511](https://github.com/maplibre/maplibre-native/pull/4511)).
+- Reduce symbol buffers memory by using instancing (Core optimization) ([#4383](https://github.com/maplibre/maplibre-native/pull/4383)).
+
+## 13.5.1
+
+### 🐞 Bug fixes
+
+- fix(core): Fix surface transform ([#4495]https://github.com/maplibre/maplibre-native/pull/4495)
+- fix(core): Fix nullptr access during custom layer pre-render ([#4496]https://github.com/maplibre/maplibre-native/pull/4496)
+- android: reduce Android AAR size with header-only Prefab ([#4483]https://github.com/maplibre/maplibre-native/pull/4483)
+
+### ✨ Features and improvements
+
+- core: rename mbgl namespace to mln ([#4487]https://github.com/maplibre/maplibre-native/pull/4487)
+
 ## 13.5.0
 
 ### 🐞 Bug fixes
@@ -592,7 +620,7 @@ Thanks to everyone who helped test the pre-releases!
 - Reuse prefetched tiles to avoid empty screen ([#2668](https://github.com/maplibre/maplibre-native/pull/2668)).
 - Update Android Dependencies, use [maplibre-gestures-android](https://github.com/maplibre/maplibre-gestures-android) ([#2714](https://github.com/maplibre/maplibre-native/pull/2714)).
 - Update dependency gradle to v8.10 ([#2721](https://github.com/maplibre/maplibre-native/pull/2721)).
-- Cleanup `mbgl/actor/mailbox*` implementation for repetition in ensuring valid weakScheduler exists before usage ([#2733](https://github.com/maplibre/maplibre-native/pull/2733)).
+- Cleanup `mln/actor/mailbox*` implementation for repetition in ensuring valid weakScheduler exists before usage ([#2733](https://github.com/maplibre/maplibre-native/pull/2733)).
 - Use latest MapLibre Style Spec ([#2756](https://github.com/maplibre/maplibre-native/pull/2756)).
   This PR adds two new APIs to `TransitionOptions` of `LocationIndicatorLayer`: `getBearingTransition()` and `setBearingTransition()`.
 - Use timestamps for attribute updates ([#2629](https://github.com/maplibre/maplibre-native/pull/2629)).

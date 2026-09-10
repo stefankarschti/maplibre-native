@@ -4,30 +4,30 @@
 #include "ny_route.hpp"
 #include "test_writer.hpp"
 
-#include <mbgl/annotation/annotation.hpp>
-#include <mbgl/gfx/backend.hpp>
-#include <mbgl/gfx/backend_scope.hpp>
-#include <mbgl/map/camera.hpp>
-#include <mbgl/math/angles.hpp>
-#include <mbgl/math/clamp.hpp>
-#include <mbgl/renderer/renderer.hpp>
-#include <mbgl/style/expression/dsl.hpp>
-#include <mbgl/style/image.hpp>
-#include <mbgl/style/layers/fill_extrusion_layer.hpp>
-#include <mbgl/style/layers/fill_layer.hpp>
-#include <mbgl/style/layers/line_layer.hpp>
-#include <mbgl/style/sources/custom_geometry_source.hpp>
-#include <mbgl/style/sources/geojson_source.hpp>
-#include <mbgl/style/style.hpp>
-#include <mbgl/style/transition_options.hpp>
-#include <mbgl/util/chrono.hpp>
-#include <mbgl/util/geo.hpp>
-#include <mbgl/util/interpolate.hpp>
-#include <mbgl/util/io.hpp>
-#include <mbgl/util/logging.hpp>
-#include <mbgl/util/instrumentation.hpp>
-#include <mbgl/util/platform.hpp>
-#include <mbgl/util/string.hpp>
+#include <mln/annotation/annotation.hpp>
+#include <mln/gfx/backend.hpp>
+#include <mln/gfx/backend_scope.hpp>
+#include <mln/map/camera.hpp>
+#include <mln/math/angles.hpp>
+#include <mln/math/clamp.hpp>
+#include <mln/renderer/renderer.hpp>
+#include <mln/style/expression/dsl.hpp>
+#include <mln/style/image.hpp>
+#include <mln/style/layers/fill_extrusion_layer.hpp>
+#include <mln/style/layers/fill_layer.hpp>
+#include <mln/style/layers/line_layer.hpp>
+#include <mln/style/sources/custom_geometry_source.hpp>
+#include <mln/style/sources/geojson_source.hpp>
+#include <mln/style/style.hpp>
+#include <mln/style/transition_options.hpp>
+#include <mln/util/chrono.hpp>
+#include <mln/util/geo.hpp>
+#include <mln/util/interpolate.hpp>
+#include <mln/util/io.hpp>
+#include <mln/util/logging.hpp>
+#include <mln/util/instrumentation.hpp>
+#include <mln/util/platform.hpp>
+#include <mln/util/string.hpp>
 
 #if !defined(MBGL_LAYER_CUSTOM_DISABLE_ALL)
 #include "example_custom_drawable_style_layer.hpp"
@@ -175,7 +175,7 @@ void tileLodZoomShift(mln::Map &map, bool positive) {
     auto shift = positive ? tileLodZoomShiftStep : -tileLodZoomShiftStep;
     shift = map.getTileLodZoomShift() + shift;
     shift = mln::util::clamp(shift, -2.5, 2.5);
-    mln::Log::Info(mln::Event::OpenGL, "Zoom shift: " + std::to_string(shift));
+    mln::Log::Info(mln::Event::GraphicsBackend, "Zoom shift: " + std::to_string(shift));
     map.setTileLodZoomShift(shift);
     map.triggerRepaint();
 }
@@ -216,7 +216,8 @@ void addFillExtrusionLayer(mln::style::Style &style, bool visible) {
 } // namespace
 
 void glfwError(int error, const char *description) {
-    mln::Log::Error(mln::Event::OpenGL, std::string("GLFW error (") + std::to_string(error) + "): " + description);
+    mln::Log::Error(mln::Event::GraphicsBackend,
+                    std::string("GLFW error (") + std::to_string(error) + "): " + description);
 }
 
 GLFWView::GLFWView(bool fullscreen_,
@@ -242,7 +243,7 @@ GLFWView::GLFWView(bool fullscreen_,
 #endif
 
     if (!glfwInit()) {
-        mln::Log::Error(mln::Event::OpenGL, "failed to initialize glfw");
+        mln::Log::Error(mln::Event::GraphicsBackend, "failed to initialize glfw");
         exit(1);
     }
 
@@ -288,7 +289,7 @@ GLFWView::GLFWView(bool fullscreen_,
     window = glfwCreateWindow(width, height, "MapLibre Native", monitor, nullptr);
     if (!window) {
         glfwTerminate();
-        mln::Log::Error(mln::Event::OpenGL, "failed to initialize window");
+        mln::Log::Error(mln::Event::GraphicsBackend, "failed to initialize window");
         exit(1);
     }
 
@@ -312,10 +313,10 @@ GLFWView::GLFWView(bool fullscreen_,
 #if defined(__APPLE__) && !defined(MLN_RENDER_BACKEND_VULKAN)
     int fbW, fbH;
     glfwGetFramebufferSize(window, &fbW, &fbH);
-    backend->setSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
+    backend->setFramebufferSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
 #endif
 
-    pixelRatio = static_cast<float>(backend->getSize().width) / width;
+    pixelRatio = static_cast<float>(backend->getFramebufferSize().width) / width;
 
     glfwMakeContextCurrent(nullptr);
 
@@ -1026,7 +1027,7 @@ void GLFWView::onWindowResize(GLFWwindow *window, int width, int height) {
 #ifdef __APPLE__
     int fbW, fbH;
     glfwGetFramebufferSize(window, &fbW, &fbH);
-    view->backend->setSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
+    view->backend->setFramebufferSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
 #endif
 }
 
@@ -1034,7 +1035,7 @@ void GLFWView::onFramebufferResize(GLFWwindow *window, int width, int height) {
     MLN_TRACE_FUNC();
 
     auto *view = reinterpret_cast<GLFWView *>(glfwGetWindowUserPointer(window));
-    view->backend->setSize({static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
+    view->backend->setFramebufferSize({static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
 
     // This is only triggered when the framebuffer is resized, but not the
     // window. It can happen when you move the window between screens with a
