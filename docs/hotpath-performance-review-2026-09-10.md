@@ -1,200 +1,333 @@
 # Shared-core hot-path performance review
 
-Reviewed on 2026-09-10 at commit `0ffe6336b4e7`. Scope: shared rendering, symbol placement, tile decoding/layout, feature queries, and GeoJSON processing. Backend implementations were inspected where necessary to determine the consequences of shared-core work. No source code was changed.
+Originally reviewed on 2026-09-10 at `0ffe6336b4e7`; rechecked on 2026-10-05 at `8fe70930853e`. Scope: **interactive rendering and symbol placement** during pan, zoom, rotation, pitch, and animation-driven redraws. Backend code was inspected to establish the consequences of shared-core work. Only this document was changed.
 
-The strongest broad opportunity is to preserve existing drawable metadata when geometry and bindings have not changed. Next are allocation-heavy collision queries and unnecessary source/layer orchestration. Several narrower workloads have larger asymptotic opportunities: symbol sort keys, large feature queries, and repeated MVT layer parsing.
+The broadest candidate is preserving stable drawable metadata. Dense labels add two distinct opportunities: removing allocation from collision tests and reducing preparation performed even when collision placement is throttled. Start implementation with bounded changes whose removed work is easy to count, then use frame traces to choose among the larger reuse proposals.
 
-This is a **source-based review, not a measured profile**. Rankings reflect expected user-visible impact, frequency, and reach across platforms; they are not measured speedups. “High confidence” means the redundant work or complexity is directly visible in the inspected code. It does not establish its fraction of application frame time. The local `build-macos-metal` configuration is Debug with Tracy disabled; no release performance baseline, device trace, or before/after benchmark was collected. No tests or builds were run for this document-only review.
+This is a **source-based review, not a measured profile**. The repeated operations below are visible in current code; their contribution to frame time and the priority order remain hypotheses. No release baseline, device trace, or before/after benchmark was collected. The inspected `build-macos-metal/CMakeCache.txt` still specifies Debug and Tracy off. No builds or runtime tests were run for this document-only update. Code links refer to this checkout at the reviewed commit.
 
-Code links point into this checkout and include the relevant starting line. Existing unrelated working-tree changes were left untouched. Platform SDK/JNI/Objective-C overhead, network behavior, database tuning, third-party internals beyond the MVT decoder, and exhaustive shader/GPU analysis are outside this review's conclusions.
+Standalone feature-query, MVT decoding/layout, `within` filtering, and GeoJSON cluster-construction findings from the original review have been removed from the active recommendations to keep this review focused. SDK bindings, networking, storage, debug visualization, optional rendered-feature capture, and exhaustive shader/GPU analysis are also outside scope.
 
-**Ranked opportunities**
+**Priorities and triggering workloads**
 
-“Every frame” below means every rendered frame reaching the relevant path. It does not imply that an idle map continuously renders. Effort: S = localized change; M = component-level change and regression coverage; L = ownership or invalidation changes across components.
+“Every frame” means every rendered frame reaching the relevant path; an idle map need not render continuously. Effort: S = localized change; M = component change with regression coverage; L = cross-component ownership/invalidation work. Priority reflects likely reach and frequency, not measured speedup.
 
-| Rank | Opportunity | Expected impact and trigger | Primary cost | Effort / confidence |
-| --- | --- | --- | --- | --- |
-| 1 | Preserve drawable attributes and segments | High: fill/raster-heavy maps and dense symbols, including camera motion | Frame CPU, allocation, backend setup | M / High |
-| 2 | Reuse collision-query duplicate tracking | High: dense labels, especially line labels and repeated anchor attempts | Placement CPU and allocation | M / High |
-| 3 | Process layer renderability once; index layers by source | High with multiple sources or many layers; smaller for one-source styles | Frame CPU and change-request churn | S–M / High |
-| 4 | Replace incremental ordered-list construction for symbol placement | High with many `symbol-sort-key` ranges | Frame CPU; quadratic iterator traversal | S–M / High |
-| 5 | Reuse decoded MVT layer metadata and selected feature data | High during complex tile loading and large rendered-feature queries | Worker/query CPU and allocation | M–L / High |
-| 6 | Avoid rebuilding unchanged dynamic symbol vertices | High for dense labels during stationary-camera redraws; less benefit during camera motion | Frame CPU and buffer updates | M–L / High |
-| 7 | Precompute symbol query ranks and remove result copies | High query-latency benefit for large selections; no benefit without queries | Query CPU and memory traffic | S–M / High |
-| 8 | Reuse uniform staging and common per-tile calculations | Medium: many drawables, outlines, halos, and segments | Frame CPU and memory traffic | M / High |
-| 9 | Reuse tile-cover results across compatible updates/sources | Medium; higher with many sources and high-pitch covers | Frame CPU | M / High |
-| 10 | Retain heatmap composite and image-source drawables | Medium when those layers are present; localized opportunity | Allocation and graphics-resource setup | S–M / High |
-| 11 | Prepare the constant polygon in `within` expressions | High with complex spatial filters; low general prevalence | Tile layout/filter CPU | M / High |
-| 12 | Hoist repeated GeoJSON cluster property-map copies | Medium for large clustered datasets with several aggregate properties | Source construction CPU and allocation | S / High |
+| Priority | Opportunity | When it can help | Removed work / effort |
+| --- | --- | --- | --- |
+| 1 | Preserve drawable attributes and segments | Stable fill/raster tiles and dense symbols, including camera motion | Metadata allocation and backend setup / M |
+| 2 | Reuse collision duplicate tracking | Placement frames with dense labels, line labels, or repeated anchor attempts | Hash-node allocation and repeated lookup / M |
+| 3 | Apply renderability once; group layers by source | Every render-tree update, especially with multiple populated sources | Repeated layer scans and group remove/add requests / S, then M |
+| 4 | Batch symbol placement ordering | Every preparation with many `symbol-sort-key` ranges, even between placement runs | Quadratic list traversal / S–M |
+| 5 | Gate dynamic symbol-buffer regeneration | Fixed-camera redraws; vertical-only placement can also benefit during motion | Reprojection, glyph-buffer writes, backend updates / M–L |
+| 6 | Reuse uniform staging and common calculations | Many drawables, fill outlines, text/halo pairs, or segments | Temporary allocation and duplicate CPU calculations / S–M |
+| 7 | Share equivalent tile-cover results | Multiple compatible sources; optionally repeated fixed-camera updates | Cover traversal and temporary allocation / M |
+| 8 | Retain heatmap composite and image drawables | Rendered frames containing these overlays | Drawable and texture setup / S–M |
 
-These improvements overlap. For example, reducing symbol work can shrink the measured benefit of later uniform optimizations. Do not add their estimated benefits together. For an application dominated by selection queries, prioritize 5 and 7; for complex spatial filters, promote 11; for ordinary animated vector maps, begin with 1–3.
+These opportunities overlap. Measure each increment against the previous version; do not add hypothetical benefits together. Promote 4 for styles with many sort keys, 2 for placement spikes, and 8 only when the relevant overlays are present. The numbered list is a review-priority order, not a descending estimate of milliseconds saved.
+
+**Conditional frame-time estimates: mobile OpenGL/Vulkan**
+
+The estimate target is **mobile OpenGL and Vulkan**. No specific handset, style, or device trace has been supplied, so absolute savings cannot be inferred from the source alone. The following are **low-confidence planning scenarios**, calculated from explicitly assumed current path costs and removable fractions. Those inputs are engineering assumptions, not measurements or claims about a typical phone. They describe optimized builds with warm tiles and the stated workload; actual savings can fall outside the ranges, including zero. Replace the assumed costs with exclusive CPU timings from the target trace before using these numbers to commit to a performance target.
+
+The model is `CPU time saved = current cost of the affected work × net fraction eliminated`. The fractions below assume modest new bookkeeping overhead. They apply to the named work, not the entire frame or placement pass. Rows are sorted by the upper end of their scenario estimate; these are different workloads, so this is a ranking of conditional potential, not a comparison on one map.
+
+| Finding | Workload and assumed current cost of the affected work | Assumed net fraction eliminated | Estimated CPU saving per affected frame |
+| --- | --- | --- | --- |
+| 4: batch placement ordering | Many sort-key ranges; list-order construction costs 1–5 ms | 80–95% | About **0.8–4.8 ms**, including frames reusing collision placement |
+| 5: gate dynamic symbol buffers | Dense labels with reusable output; regeneration costs 0.5–3 ms | 80–95% | About **0.4–2.9 ms** on eligible redraws |
+| 2: collision duplicate scratch | Dense placement; duplicate tracking alone costs 0.5–3 ms | 50–80% | About **0.25–2.4 ms** on placement frames; **0 ms** between placement runs |
+| 1: retain drawable metadata | Many stable fill/raster/symbol drawables; metadata and resulting backend setup cost 0.5–2 ms | 50–90% | About **0.25–1.8 ms** during camera motion or other redraws |
+| 3: final renderability and source grouping | Many populated sources/layers; redundant scans and group churn cost 0.2–1 ms | 50–80% | About **0.1–0.8 ms**; assumes both changes, not just moving the status loop |
+| 7: share tile covers | Five sources with identical effective cover arguments; their cover calculations total 0.25–1 ms | Approximately 80%, assuming negligible lookup/result-handling cost | About **0.2–0.8 ms**; lower with fewer compatible sources |
+| 6: uniform staging and shared calculations | Many drawables; staging and repeated calculations cost 0.2–1 ms | 25–60% | About **0.05–0.6 ms**; capacity reuse alone targets only part of this |
+| 8: retain overlay resources | Active heatmap/image overlays; repeated resource setup costs 0.1–0.5 ms | 50–80% | About **0.05–0.4 ms**; excludes heatmap density rendering |
+
+The decimal endpoints are arithmetic results from the assumptions, not measurement precision. For example, finding 1 yields 1.2 ms if the targeted metadata/setup work takes 1.5 ms and retention eliminates 80%; if that work takes only 0.1 ms, the same fraction saves 0.08 ms. Source inspection establishes repetition, not which baseline applies.
+
+Treat GL and Vulkan as separate measurements. For 1, GL additionally avoids fill/raster VAO reconstruction; Vulkan shares metadata costs but has no GL VAOs. For 5, the current Vulkan path replaces changed shared vertex buffers, whereas GL updates them; avoiding regeneration can remove different amounts of driver/resource work. For 6, consolidated staging-vector reuse applies to Vulkan, while shared calculations can benefit both. These differences justify backend-specific profiling, not an unsupported fixed GL/Vulkan speed ratio. No GPU-time reduction is included in the estimates.
+
+For ordinary moving-camera maps, 1 remains the broadest candidate and 2 targets placement spikes. Finding 4 can overtake both with enough sort-key ranges. Finding 5 saves essentially nothing on the line/variable-anchor branches while their camera inputs change; its moving-camera opportunity is the vertical-only branch. Findings 7 and 8 need compatible sources and overlays respectively. A style missing the relevant work gets no gain.
+
+Placement savings must also be weighted by frequency: saving 2 ms on five placement frames per second at 60 rendered frames per second averages about 0.17 ms per rendered frame, while still removing 2 ms from each affected frame. This is an illustration, not an assumed placement cadence or a prediction of p95/p99 improvement.
+
+These are CPU savings, not guaranteed reductions in displayed frame intervals. A simplified overlapping pipeline has a frame period near `max(CPU critical-path time, GPU time)`; reducing CPU work helps throughput only while CPU remains the limiting stage. A frame already capped at 60 Hz may stay at 16.67 ms and gain deadline headroom instead. For scale, 1 ms is 6% of a 60 Hz frame budget and 12% of a 120 Hz budget. Measure presentation timing and GPU time alongside the CPU changes.
 
 **1. Preserve drawable attributes and segments when their inputs are unchanged**
 
-Evidence: [RenderFillLayer::update](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_fill_layer.cpp:232) creates a new attribute array for each tile, reads paint bindings, and calls `updateVertexAttributes` for existing fill/outline drawables. [RenderRasterLayer::update](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_raster_layer.cpp:182) similarly rebuilds metadata through `buildVertexData`, including the existing-drawable path at line 320. [updateTileDrawable](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_symbol_layer.cpp:352) repopulates attributes for existing symbol drawables; [VertexAttributeArray::set](/Users/stefan/maplibre-native-stefan/src/mln/gfx/vertex_attribute.cpp:100) creates a replacement attribute object each time.
+Evidence: [RenderFillLayer::update](../src/mln/renderer/layers/render_fill_layer.cpp#L322) allocates an attribute array per tile and calls `updateVertexAttributes` on existing fill, pattern, and basic-outline drawables. The triangulated-outline variant already has a modification-time guard. The [raster buildVertexData lambda](../src/mln/renderer/layers/render_raster_layer.cpp#L182) reconstructs attribute metadata and replaces existing drawable segments; unmasked tiles share `staticAttrs` only within that update call.
 
-For fills and rasters, the consequences extend beyond small wrapper allocations:
+The downstream costs are concrete:
 
-- [Drawable::setVertexAttributes](/Users/stefan/maplibre-native-stefan/include/mln/gfx/drawable.hpp:194) resets `attributeUpdateTime`, forcing binding reconstruction.
-- [OpenGL updateVertexAttributes](/Users/stefan/maplibre-native-stefan/src/mln/gl/drawable_gl.cpp:88) allocates new segment objects with invalid VAOs. [Upload](/Users/stefan/maplibre-native-stefan/src/mln/gl/drawable_gl.cpp:180) rebuilds bindings and creates the missing VAOs.
-- [Metal updateVertexAttributes](/Users/stefan/maplibre-native-stefan/src/mln/mtl/drawable.cpp:357) also recreates segments. [Metal attribute binding](/Users/stefan/maplibre-native-stefan/src/mln/mtl/upload_pass.cpp:163) passes `!lastUpdate` as `forceUpdate` to shared-buffer resolution, so resetting the timestamp causes redundant buffer-update attempts.
+- [Drawable::setVertexAttributes](../include/mln/gfx/drawable.hpp#L194) resets the binding timestamp.
+- [OpenGL updateVertexAttributes](../src/mln/gl/drawable_gl.cpp#L88) replaces segments with invalid VAOs; [upload](../src/mln/gl/drawable_gl.cpp#L185) rebuilds bindings and creates missing VAOs.
+- [Metal updateVertexAttributes](../src/mln/mtl/drawable.cpp#L357) also replaces segments. [Metal attribute binding](../src/mln/mtl/upload_pass.cpp#L163) forces shared-buffer update attempts when the timestamp is absent.
 
-The cost scales with visible layer/tile combinations, attributes, and segments, even when camera movement only requires new matrices. **Do not count every update attempt as a GPU allocation or transfer:** [Metal BufferResource::update](/Users/stefan/maplibre-native-stefan/src/mln/mtl/buffer_resource.cpp:98) compares unchanged full-size buffers before replacement; OpenGL and Vulkan also retain shared buffers when their data has not changed. Metadata construction, binding work, VAO churn on GL, and some full-buffer comparisons remain real costs.
+Update attempts are not necessarily transfers. [Metal BufferResource::update](../src/mln/mtl/buffer_resource.cpp#L98) compares unchanged full-size buffers before replacement; [GL](../src/mln/gl/upload_pass.cpp#L95) and [Vulkan](../src/mln/vulkan/upload_pass.cpp#L65) retain unmodified shared vertex buffers. Metadata allocation, binding work, GL VAO churn, and Metal byte comparisons remain avoidable costs.
 
-Recommended option: add a narrow fast path preserving attributes and segments when bucket identity, geometry/index revisions, attribute layout, and paint-binding layout are unchanged. Changed shared paint buffers should still upload normally. [Line layers](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_line_layer.cpp:336) and [circle layers](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_circle_layer.cpp:231) already retain existing drawables without rebuilding this metadata, providing local examples.
+Implement fill/raster retention first: preserve metadata when bucket identity, geometry/index revisions, segment layout, and paint-binding layout are unchanged. Keep normal uploads for changed shared paint buffers. [Line](../src/mln/renderer/layers/render_line_layer.cpp#L439) and [circle](../src/mln/renderer/layers/render_circle_layer.cpp#L403) layers already retain existing drawable metadata. Avoid a gfx-interface redesign until a local fast path proves useful.
 
-Alternative: make attribute updates incremental and split segment replacement from binding updates at the gfx interface. This helps more callers but changes a wider contract. Symbol attributes can be retained independently of truly dynamic position/opacity buffers.
+Treat symbols as a separate follow-up. [updateTileDrawable](../src/mln/renderer/layers/render_symbol_layer.cpp#L360) repopulates instance attributes with symbol instancing enabled, and vertex attributes otherwise. [VertexAttributeArray::set](../src/mln/gfx/vertex_attribute.cpp#L101) replaces each attribute object. This is not the same segment-replacement path as fill/raster. Preserve stable attribute descriptors while allowing dynamic positions, opacity, and sorted-instance data to update. Current [backend defines](../include/mln/shaders/layer_ubo.hpp#L73) enable symbol instancing on Metal/Vulkan, so validate both forms.
 
-Validation: replay a fixed pan/zoom over fill-heavy vector tiles and raster tiles; count attribute allocations, segment allocations, binding rebuilds, VAO creation, and actual buffer bytes. Test feature-state paint changes, constant-to-data-driven transitions, fill outlines/patterns, raster masking, bucket replacement, and context recreation. Success is near-zero geometry-metadata reconstruction for stable tiles while pixels and feature-state behavior remain identical.
+Validation: fixed pan/zoom over fills and rasters; count attribute/segment allocations, binding rebuilds, GL VAO creation, and actual buffer updates. Stable tiles should approach zero metadata reconstruction after warmup. Exercise feature-state and global-state paint changes, constant/data-driven transitions, patterns/outlines, raster masking, bucket replacement, and context recreation. Retention must preserve the existing distinction between old-style and current-tweaker drawables.
 
-**2. Remove per-query hash allocations from collision duplicate tracking**
+**2. Remove hash-node allocation from collision duplicate tracking**
 
-Evidence: [GridIndex::query for boxes](/Users/stefan/maplibre-native-stefan/src/mln/util/grid_index.hpp:235) constructs two local `std::unordered_set`s. Each newly visited primitive performs `contains` followed by `insert`. The [circle overload](/Users/stefan/maplibre-native-stefan/src/mln/util/grid_index.hpp:300) repeats the pattern. [CollisionIndex::placeFeature](/Users/stefan/maplibre-native-stefan/src/mln/text/collision_index.cpp:149) calls `hitTest` for label boxes; line placement calls it for projected circles at line 317. `hitTest` uses these same query implementations.
+Evidence: both [box queries](../src/mln/util/grid_index.hpp#L235) and [circle queries](../src/mln/util/grid_index.hpp#L300) create two local `std::unordered_set`s. Their cell-walking paths use `contains` followed by `insert` for each new primitive. [CollisionIndex::placeFeature](../src/mln/text/collision_index.cpp#L149) reaches these queries through box and projected-circle `hitTest` calls when overlap is disallowed.
 
-Dense placement therefore creates and destroys hash-table storage repeatedly, potentially once for every attempted box/circle. Empty queries need not allocate, and early collision exits already limit work; the opportunity concerns populated queries, especially misses or predicates rejecting many candidates.
+This cost belongs to placement runs, not every frame: [continuous placement is throttled](../src/mln/renderer/render_orchestrator.cpp#L560). Populated misses and predicates rejecting many candidates are useful stress cases. Empty sets need not allocate, and early collision exits already limit work.
 
-Recommended option: use reusable generation-stamp arrays indexed by the existing primitive IDs, with separate box/circle tracking. A query advances its generation rather than allocating nodes or clearing all entries. Keep scratch state owned by the query caller or a placement-local context so concurrent read queries remain safe. Account for generation wraparound and growth as symbols enter the grid.
+Use caller-owned generation-stamp arrays indexed by the existing dense primitive IDs, separately for boxes and circles. Advance the generation per query; grow storage as the grid grows. Account for wraparound, grid lifetime/reset, and independent scratch for concurrent or nested queries. Preserve traversal and predicate invocation order.
 
-Lower-risk option: reuse scratch containers and use `insert(uid).second` for one lookup instead of two. Note that clearing a node-based set still frees its nodes; retaining only its bucket array is not a complete allocation fix. A caller-owned flat scratch representation or a small-vector path for tiny queries may be preferable after measurement.
+A smaller change is `insert(uid).second`, removing the double lookup. Merely retaining a node-based set's bucket array does not remove node allocation: `clear()` frees the nodes. Choose scratch storage based on visited-candidate counts and memory measurements.
 
-Validation: profile placement with sparse/dense point labels, line labels, multiple variable anchors, and cross-source collision groups. Measure allocations per placement and p95/p99 placement duration. Compare exact results with [grid-index tests](/Users/stefan/maplibre-native-stefan/test/util/grid_index.test.cpp), including duplicate cells, boxes/circles, predicates, early exits, and independent concurrent query scratch. Do not remove deduplication or change collision order merely to make the benchmark faster.
+Validation: sparse/dense point labels, line labels, variable anchors, and cross-source collision groups. Record allocations per placement and p95/p99 placement duration separately from frames reusing placement. Extend [grid-index coverage](../test/util/grid_index.test.cpp) for duplicate cells, box/circle combinations, predicates, early exits, generation wraparound, and scratch isolation. Collision outcomes must remain identical.
 
-**3. Resolve renderability once and avoid scanning every layer for every source**
+**3. Apply final renderability once; avoid scanning every layer for every source**
 
-Evidence: [createRenderTree](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_orchestrator.cpp:364) initializes `updateList` to false, loops over every source, scans every layer to find matches, then scans **all layers again inside the source loop** to apply renderability.
+Evidence: [createRenderTree](../src/mln/renderer/render_orchestrator.cpp#L402) initializes `updateList` to false, scans all layers for each source, then scans all layers again inside the source loop to apply renderability. Both scans cost O(S × L) for S sources and L layers.
 
-There are two distinct costs. With S sources and L layers, the two scans each perform O(S × L) visits. More subtly, an already-visible layer belonging to source B remains false in the new `updateList` while source A is processed. It is marked non-renderable, then marked renderable again when B is processed. [markLayerRenderable and activateLayerGroup](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_layer.cpp:203) allocate remove/add requests; [orchestrator group operations](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_orchestrator.cpp:908) erase and reinsert the existing group. The final visibility can be correct while intermediate work is unnecessary. This is not a claim that the entire drawable is recreated or that a visible flicker occurs.
+An already-visible layer belonging to source B remains false while earlier source A is processed. It is marked non-renderable, then renderable when B is reached. [markLayerRenderable / activateLayerGroup](../src/mln/renderer/render_layer.cpp#L209) allocate remove/add requests, and [group operations](../src/mln/renderer/render_orchestrator.cpp#L967) erase/reinsert the existing group. Final visibility can be correct despite this intermediate churn; this does not imply drawable recreation or visible flicker.
 
-Recommended first step: apply final renderability once after all sources have contributed. Include the no-source case and preserve pending requests created earlier during style diff processing. This removes one S × L scan and, in the steady-state multi-source example, removes the intermediate off/on request pair.
+First, apply renderability once after all sources have contributed. Flush accumulated changes outside the source loop, including requests from earlier style-diff processing and updates with no sources. The separate source-less background/custom-layer logic needs explicit regression coverage; moving the status loop alone is not a redesign of that logic.
 
-Second option: maintain source-to-ordered-layer membership, rebuilding it when style membership/order changes. Compute visibility, zoom eligibility, and 3D flags once per layer, then perform source-specific work only on its members. The association work becomes approximately O(S + L), excluding tile updates and ordered render-item insertion.
+Then, if association remains material, build source-to-ordered-layer membership in one pass. A per-update grouping avoids persistent-cache invalidation; retain it across updates only if measurement justifies it. Compute visibility, zoom eligibility, and 3D flags once per layer, preserving global layer order and source-specific relayout rules, including global-state dependencies. Association visits can become O(S + L), excluding tile work and ordered render-item insertion.
 
-For illustration, the existing [multiple-sources benchmark](/Users/stefan/maplibre-native-stefan/benchmark/api/render.benchmark.cpp:126) adds 50 sources with 50 layers each. Those additions alone imply at least 125,000 source/layer combinations per full scan and 250,000 visits across both scans; the pre-existing base style increases the totals. These are operation counts, not timings. Its empty added sources do not establish the magnitude of active drawable-group churn, so also test populated sources.
+The [multiple-sources benchmark](../benchmark/api/render.benchmark.cpp#L126) adds 50 sources with 50 layers each: at least 125,000 source/layer combinations per scan, or 250,000 visits across both scans. These are operation counts, not timings. The empty added sources do not establish active group churn.
 
-Validation: 1, 5, and 50 populated sources; track change-request counts and `createRenderTree` CPU time. A steady frame should enqueue no visibility remove/add pairs when membership is unchanged. Exercise adding/removing/reordering layers, changing visibility and zoom bounds, background/custom layers without sources, and heatmap render-target activation.
+Validation: 1/5/50 populated sources; measure `createRenderTree` time and change requests. A steady update should enqueue no visibility remove/add pairs for unchanged layers. Cover layer/source removal, reorder, visibility, zoom bounds, global-state relayout, source-less layers, and heatmap render-target activation.
 
-**4. Build symbol placement order in a batch instead of searching a linked list for every range**
+**4. Build symbol placement order in a batch**
 
-Evidence: [RenderSymbolLayer::prepare](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_symbol_layer.cpp:196) clears placement data each frame. For every sort-key range it uses `std::upper_bound` and inserts at that position. Crucially, [LayerPlacementData is a std::list](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_layer.hpp:75), so binary search has linear iterator traversal. Across R ranges, rebuilding the ordered list can require O(R²) iterator steps, plus one node allocation per entry. The issue is not vector-element shifting.
+Evidence: [RenderSymbolLayer::prepare](../src/mln/renderer/layers/render_symbol_layer.cpp#L200) clears placement data, then uses `std::upper_bound` for every sort-key range. [LayerPlacementData is a std::list](../src/mln/renderer/render_layer.hpp#L76): binary search still traverses a linear number of iterators. Building R entries can require O(R²) iterator steps and R node allocations. This preparation occurs before the placement throttle, so frames reusing collision placement still pay it.
 
-This preparation precedes the [placement throttle](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_orchestrator.cpp:452), so its cost is paid even on frames that reuse recent collision placement. It is most relevant when `symbol-sort-key` has many distinct values across visible tiles; unkeyed symbols use the simpler append path.
+Append keyed entries in traversal order, then stable-sort the list once by sort key. This reduces ordering work to O(R log R) and preserves the equal-key order produced by `upper_bound`. Keep the unkeyed append path. **List sorting does not remove node allocation**; a reserved vector is a separate follow-up requiring a review of reference/iterator assumptions.
 
-Recommended option: for keyed placement, append all entries in traversal order, then use stable list sorting once, preserving the equal-key order currently produced by `upper_bound`. Retain the unkeyed append behavior. This changes ordering work to O(R log R) without first changing the container contract. A more substantial option is to collect into a reserved vector and stable-sort it, provided users do not depend on list iterator/reference behavior. A merge of already-sorted per-tile ranges is another option if measurements justify the extra machinery.
+Validation: vary tiles and ranges with interleaved/equal keys; compare exact traversal order, bucket-group leadership, and resulting collisions. Check the keyed/unkeyed assumptions across retained and replacement buckets. Measure preparation independently of collision placement, including frames on which placement is skipped.
 
-Validation: vary range count and tile count, with interleaved keys and many equal keys. Compare exact placement traversal order and rendered collisions, including mixed tiles and layer grouping. Measure `prepare` separately from actual placement. Avoid relying on the placement throttle to hide this cost.
+**5. Gate dynamic symbol-buffer regeneration by subpath**
 
-**5. Reuse MVT layer parsing and selectively reuse feature decoding**
+Evidence: [RenderTreeImpl::prepare](../src/mln/renderer/render_orchestrator.cpp#L105) updates placement buckets every rendered frame. [SymbolBucket::updateVertices](../src/mln/renderer/buckets/symbol_bucket.cpp#L346) gates opacity updates but always calls `updateBucketDynamicAttributeData`. The function is not expensive for every symbol: ordinary fixed-anchor point labels without vertical placement fall through without rebuilding data.
 
-Evidence: [VectorMVTTileData::getLayer](/Users/stefan/maplibre-native-stefan/src/mln/tile/vector_mvt_tile_data.cpp:88) caches the top-level layer directory, but returns a new `VectorMVTTileLayer` for each call. Its constructor creates a fresh decoder layer; the [vendored layer constructor](/Users/stefan/maplibre-native-stefan/vendor/vector-tile/include/mapbox/vector_tile.hpp:366) traverses the layer protobuf and rebuilds feature views, keys, and values.
+The relevant branches have different dependencies:
 
-[GeometryTileWorker::parse](/Users/stefan/maplibre-native-stefan/src/mln/tile/geometry_tile_worker.cpp:445) requests a layer for each layout group. Different groups targeting the same source layer repeat that metadata parse. [getFeature and getGeometries](/Users/stefan/maplibre-native-stefan/src/mln/tile/vector_mvt_tile_data.cpp:45) also create new wrappers and cache decoded geometry only in each wrapper; accepted features appearing in multiple groups can be decoded repeatedly. Existing `groupLayers` already shares compatible layout work, so the remaining opportunity is across distinct groups.
-
-There is a particularly strong query case: [FeatureIndex::addFeature](/Users/stefan/maplibre-native-stefan/src/mln/geometry/feature_index.cpp:258) creates a source-layer object separately for each candidate feature that reaches materialization. For K candidates in an MVT layer with F encoded feature entries, repeated layer-directory construction alone can approach O(K × F), before feature conversion and intersection work.
-
-Recommended first step: cache parsed immutable layer metadata within the relevant tile/query lifetime. In queries, a source-layer cache local to one query is a bounded change. In tile layout, share read-only parsed layer storage with wrappers whose lifetime keeps both storage and encoded bytes alive.
-
-Higher-memory option: retain lazy geometry/property decoding by feature index while processing multiple layout groups. Bound this by tile/layout lifetime or a measured cache budget; eagerly decoding every feature can waste time and memory on selective filters. `GeometryTileData::clone()` and worker/render-thread access require explicit ownership decisions. Do not introduce unsynchronized mutable caches into shared data.
-
-Validation: compare 1/5/20 layout groups on the same large source layer, plus wide queries selecting many features. Count decoder-layer constructions and actual geometry decodes; report tile completion latency, query latency, and peak/resident memory. [Parse_VectorTile](/Users/stefan/maplibre-native-stefan/benchmark/parse/vector_tile.benchmark.cpp:8) visits each source layer once, so it will not alone reveal this repetition. Include [vector-tile tests](/Users/stefan/maplibre-native-stefan/test/tile/vector_tile.test.cpp), malformed data, polygon fixup, and tile eviction. This specific parsing finding applies to MVT; it is not a claim about the MLT implementation.
-
-**6. Gate dynamic symbol-vertex regeneration on the inputs it actually uses**
-
-Evidence: [RenderTreeImpl::prepare](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_orchestrator.cpp:93) updates placement buckets each frame. [SymbolBucket::updateVertices](/Users/stefan/maplibre-native-stefan/src/mln/renderer/buckets/symbol_bucket.cpp:346) gates opacity updates, but always calls `updateBucketDynamicAttributeData`. That [function](/Users/stefan/maplibre-native-stefan/src/mln/text/placement.cpp:776) reprojects line labels, or clears and rebuilds dynamic text/icon attributes for variable anchors and vertical placement. The variable-anchor path also constructs a temporary `placedTextShifts` map.
-
-Clearing/appending [marks the vertex vector dirty](/Users/stefan/maplibre-native-stefan/src/mln/gfx/vertex_vector.hpp:69), so identical output can still lead to backend update work. Conversely, `updateModified()` only advances timestamps for dirty vectors: it does **not** indiscriminately dirty all static symbol data. The opportunity is to avoid the unnecessary regeneration itself.
-
-Recommended option: record the transform/projection inputs, placement/visibility generation, bucket revision, and relevant size/layout state used for the dynamic buffer. Reuse output when these are unchanged. Begin with stationary-camera frames caused by unrelated paint animation or another source. Continue updating opacity/fade uniforms independently.
-
-Alternative: for camera motion, move suitable point/variable-anchor transformations into shader inputs, or reuse scratch storage and reduce CPU output expansion. This changes more rendering behavior and needs separate backend design; it is a second-stage option. Line reprojection genuinely depends on the camera, so simply skipping it during motion is invalid.
-
-Validation: dense line labels, variable-anchor POIs, vertical writing, and icon-text-fit, both with a moving camera and a fixed camera plus unrelated repaint. Measure dynamic bytes generated/uploaded, CPU time, and temporary allocations. Test placement changes at an unchanged camera, bucket arrival, fading, orientation changes, and tile wrapping. An entirely idle map has no frames to optimize here.
-
-**7. Replace linear symbol-rank searches inside query sorting; eliminate extra result copies**
-
-Evidence: [FeatureIndex::lookupSymbolFeatures](/Users/stefan/maplibre-native-stefan/src/mln/geometry/feature_index.cpp:196) sorts K hits. With `featureSortOrder` present, every comparison performs two linear `std::find`s in an N-entry order vector. This produces O(K log K × N) rank-search work. Large box queries can make K comparable to N.
-
-Recommended option: lazily construct a feature-index-to-first-rank map for the current order snapshot, then use constant-time rank lookup during sorting. A query-local map changes work to O(N + K log K) without retained state. A cached map saves more on repeated queries but must be replaced when the order snapshot changes. Keep the **first occurrence** of duplicate feature IDs: the current `std::find` semantics matter when a feature has multiple symbol instances. For tiny hit sets, the original lookup can be cheaper than building a full map; use measurements to decide on a threshold.
-
-Two independent low-risk copy reductions exist in the same output path. [queryRenderedSymbols](/Users/stefan/maplibre-native-stefan/src/mln/renderer/render_orchestrator.cpp:613) uses `for (auto layer : bucketSymbols)`, copying each map entry and its feature vector before moving from the copy. [FeatureIndex::addFeature](/Users/stefan/maplibre-native-stefan/src/mln/geometry/feature_index.cpp:298) inserts a completed local `Feature` as an lvalue. Iterate the former by reference and move the latter when implementing. Returning separate public features per style layer may still require independent values; those copies cannot all be removed blindly.
-
-Validation: point queries and progressively larger boxes over overlapping, viewport-Y-sorted symbols; include duplicate source features and a bearing change between queries. Compare the exact output order and content. Use [API query benchmarks](/Users/stefan/maplibre-native-stefan/benchmark/api/query.benchmark.cpp:67) as a starting point, adding a workload that actually produces `featureSortOrder`. Measure query p50/p95 and allocation/bytes copied. Coordinate measurements with finding 5, which targets a different cost in the same queries.
-
-**8. Reuse uniform staging and compute shared tile values fewer times**
-
-Evidence: [SymbolLayerTweaker::execute](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/symbol_layer_tweaker.cpp:92) creates two drawable-count-sized staging vectors in the consolidated-UBO configuration. Its drawable loop repeatedly computes matrices, size evaluations, and interpolation factors; text/halo or other drawables can share many of those inputs. [FillLayerTweaker](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/fill_layer_tweaker.cpp:60) follows the same allocation pattern and computes pattern-specific values before selecting the actual fill variant. [getTileMatrix](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layer_tweaker.cpp:28) recomputes the tile transform and projection product per invocation.
-
-Recommended option: retain staging-vector capacity in each tweaker and cache common calculations for the current tile/variant within a frame. Skip pattern work for solid fills. Separate slowly changing tile properties from camera-dependent matrices where the existing shader contract permits it.
-
-A later option is to upload only changed uniform blocks/ranges, but measure the actual backend benefit. [UBO consolidation](/Users/stefan/maplibre-native-stefan/include/mln/shaders/layer_ubo.hpp:73) already exists for Metal, Vulkan, and WebGPU. Paint uniform blocks also have `propertiesUpdated` guards. [OpenGL](/Users/stefan/maplibre-native-stefan/src/mln/gl/uniform_buffer_gl.cpp:129), [Metal](/Users/stefan/maplibre-native-stefan/src/mln/mtl/buffer_resource.cpp:98), and [Vulkan](/Users/stefan/maplibre-native-stefan/src/mln/vulkan/buffer_resource.cpp:198) have content-comparison paths that can suppress unchanged writes. The opportunity is not to introduce batching or equality checks that already exist.
-
-Validation: count staging allocations and matrix/size computations per frame, alongside actual buffer updates. Cache keys must preserve translation/anchor, origin, projection mode, alignment, and the [layer/sublayer depth adjustment](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layer_tweaker.cpp:52). Tile ID alone is insufficient for a universal final-matrix cache. Retained vector capacity also needs a memory-reduction policy after unusually large frames.
-
-**9. Reuse tile-cover calculations without suppressing tile lifecycle work**
-
-Evidence: [TilePyramid::update](/Users/stefan/maplibre-native-stefan/src/mln/renderer/tile_pyramid.cpp:94) derives ideal/prefetch covers and calls `util::tileCover` for each rendering source on each update. Equivalent sources can request the same cover, and a stationary camera can request it repeatedly while fading or other style work drives redraws.
-
-Recommended option: memoize cover results within one render update for sources with identical effective cover arguments. This avoids cross-frame invalidation initially. A second option retains the previous cover for unchanged camera/viewport/projection, zoom range, effective zoom, source-type/tile-size effects, and LOD parameters. Prefetch cover parameters must be distinguished from ideal cover parameters.
-
-Only reuse the geometric cover result. The remainder of `TilePyramid::update` must still process tile arrivals, retained parents/children, expiry/necessity changes, relayout, cache changes, and fades. Equal camera parameters do not mean the source has no work to do. Reuse becomes less valuable when every source has different cover parameters.
-
-Validation: multiple compatible and deliberately incompatible sources, high pitch, resize, wrap jumps, overzoom, prefetch changes, and fixed-camera tile arrivals. Count cover calls per unique argument set and time cover generation separately from tile reconciliation. Existing [tile-cover benchmarks](/Users/stefan/maplibre-native-stefan/benchmark/util/tilecover.benchmark.cpp) provide a kernel baseline; also measure whole-frame behavior.
-
-**10. Retain heatmap composite resources and image-source drawables**
-
-Evidence: [RenderHeatmapLayer::update](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_heatmap_layer.cpp:347) clears the composite layer's drawables every update, rebuilds its fullscreen quad, and creates a new color-ramp texture at line 381. The ramp itself is only 256 × 1 ([constructor](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_heatmap_layer.cpp:43)), so this is principally object/resource overhead rather than a large texture-bandwidth saving.
-
-Separately, the [image-data branch in RenderRasterLayer](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_raster_layer.cpp:237) clears and rebuilds image-source drawables for all matrices each update. Despite a nearby TODO about texture sharing, [setTextures](/Users/stefan/maplibre-native-stefan/src/mln/renderer/layers/render_raster_layer.cpp:159) already uses `bucket.texture2d`; do not claim the source image is necessarily uploaded once per matrix per frame.
-
-Recommended option: retain the heatmap composite drawable and color-ramp texture, updating ramp pixels only on color-ramp changes and rebinding/resizing when the render target changes. Retain image-source drawables while updating their transformation data; rebuild only for geometry/bucket/wrap-instance changes.
-
-Alternative: implement the heatmap and image-source changes separately; they have independent lifecycle concerns and can be measured independently. Heatmap density rendering itself remains necessary when its inputs change, and the density target is already reduced to half viewport width/height. This proposal does not promise to solve fragment-bound heatmaps.
-
-Validation: steady camera animation, heatmap color and intensity changes, image content/coordinate updates, viewport resize, world wrapping, and source removal. After warmup, unchanged ramps should create no new textures, and stable composite/image geometry should create no new drawables. Compare final pixels and actual resource counts.
-
-**11. Prepare `within` polygon projections once per reusable evaluation context**
-
-Evidence: [Within::evaluate](/Users/stefan/maplibre-native-stefan/src/mln/style/expression/within.cpp:221) calls `featureWithinPolygons` for each supported feature. [featureWithinPolygons](/Users/stefan/maplibre-native-stefan/src/mln/style/expression/within.cpp:147) reconstructs the literal polygon's tile-coordinate geometry and bounding box every time. [getTilePolygon](/Users/stefan/maplibre-native-stefan/src/mln/style/expression/within.cpp:41) allocates rings and projects every vertex using the math at line 23.
-
-For F feature evaluations and P vertices in a constant filter polygon, preparation alone is O(F × P), in addition to the necessary containment tests. A bounded prepared representation can reduce repeated preparation to O(P) for the relevant coordinate context.
-
-Recommended option: cache the projected polygon and bbox in a tile/evaluation-owned context. The current polygon projection depends on canonical zoom; begin with a conservative coordinate-context key and preserve exact integer rounding. Shared expressions can be evaluated concurrently, so an unsynchronized mutable cache on `Within` is inappropriate.
-
-Alternative: precompute a normalized polygon representation and transform it cheaply per zoom, but require exact semantic comparisons before adopting it. Do not change holes, boundary rules, or antimeridian handling to achieve a speedup.
-
-Validation: hundreds/thousands of polygon vertices and many point/line features, including mostly rejected features. Separate projection time from containment time and record temporary allocations. Exercise different zooms, wrapped coordinates, holes, boundary points, and expression tests. This deserves high priority only when spatial filters are common in the target styles.
-
-**12. Copy cluster property maps once per callback, not once per aggregate**
-
-Evidence: [GeoJSONData::create](/Users/stefan/maplibre-native-stefan/src/mln/style/sources/geojson_source_impl.cpp:108) installs cluster map/reduce callbacks. The map callback assigns `feature->properties = properties` inside the loop over `clusterProperties`; reduce similarly assigns `feature->properties = toFill` for each applicable aggregate.
-
-For C aggregate properties and P input properties, the map callback can perform O(C × P) property-copy work per feature even though all aggregates use the same input. Reduce has analogous repetition. This is source/index construction work, not an ordinary camera-render hot path.
-
-Recommended option: assign the shared input once before evaluating the relevant aggregates, retaining the existing no-work behavior when there are no aggregates or none apply. Expected map-copy work becomes O(P) per callback. A larger alternative is a non-owning evaluation feature adapter, which could remove the copy but introduces lifetime/API concerns and is unnecessary as a first step.
-
-Validation: large clustered point collections with 0/1/5/20 aggregate expressions, wide property maps, missing reduce keys, and nested property values. Compare every cluster property and total index-build time/allocations. Preserve aggregate evaluation order and the current `accumulated` semantics. With one aggregate or no clustering, expected benefit is small or absent.
-
-**Recommended implementation choices**
-
-| Objective | Start with | Reason |
+| Branch | Current repeated work | Candidate reuse boundary |
 | --- | --- | --- |
-| Best broad frame-time opportunity | 1, then 2 | Avoid repeated per-drawable setup and inner-loop allocation |
-| Small, readily reviewable changes first | 3's final renderability pass, 4's batch list sort, 7's copies, 12 | Bounded transformations with directly checkable semantics |
-| Dense labels and navigation | 2, 4, 6, then 8 | Addresses collision spikes, preparation, and per-frame glyph work separately |
-| Faster tile arrival/style-heavy maps | 5, plus 11 when used | Removes duplicated decoding/preparation on worker paths |
-| Large selection/hover workloads | 5's query-local layer cache and 7 | Removes independent superlinear costs in query materialization and ordering |
-| Lowest architectural risk | Narrow fast paths and local scratch before persistent caches | Smaller invalidation and ownership surface |
+| [Map-aligned line labels](../src/mln/text/placement.cpp#L788) | Reproject text/icons and regenerate dynamic attributes | Unchanged transform, tile matrix/wrap, placement state, size inputs, and bucket data |
+| [Variable-anchor point labels](../src/mln/text/placement.cpp#L832) | Rebuild text and fitted-icon attributes; construct `placedTextShifts` | Unchanged projection/size inputs, variable offsets, visibility/orientation, and bucket data |
+| [Vertical-only point placement](../src/mln/text/placement.cpp#L935) | Re-emit anchor/angle or hidden glyphs | This branch does not read camera state; invalidate on its symbol visibility/orientation and bucket/layout inputs |
 
-**How to establish impact before implementing**
+The vertical-only branch is a narrower first implementation candidate and can benefit during camera motion between placement changes. For line/variable-anchor paths, begin with stationary-camera redraws caused by unrelated animation. Do not skip line reprojection during camera motion.
 
-1. Establish a release or optimized-with-symbols baseline using deterministic local tiles, fixed style/camera traces, viewport/pixel ratio, device, backend, and thermal conditions. Separate warm-cache rendering from tile decode/layout and source construction. Keep correctness validation outside timed sections.
-2. Use existing [Tracy instrumentation guidance](/Users/stefan/maplibre-native-stefan/docs/mdbook/src/profiling/tracy-profiling.md) and backend captures to distinguish CPU preparation, placement, allocation, driver encoding, and GPU work. A wait for a drawable is not proof that core CPU code is slow. Record p50/p95/p99 frame/placement/query duration, not just average FPS.
-3. Use the existing [RenderingStats counters](/Users/stefan/maplibre-native-stefan/include/mln/gfx/rendering_stats.hpp:20) for buffers, textures, update bytes, and draw calls, supplementing them with allocation and actual backend-transfer measurements. Some counters count attempted updates before a backend equality check, so counter changes alone do not prove GPU bandwidth savings.
-4. Cover five representative scenarios: populated multi-source vector pan/zoom; dense symbol rotation/pitch; fixed-camera redraws with unrelated animation; cold/warm tile layout with many style groups; and small/large rendered-feature queries. Add heatmap/image overlays, clustered GeoJSON, and spatial filters when those features matter.
-5. Validate on at least one Metal device and an Android device for each supported GL/Vulkan configuration being targeted. Shared-core changes have different backend consequences; desktop-only results do not establish mobile impact. Keep WebGPU in regression coverage if it is a supported target.
-6. Implement and measure one hypothesis at a time. Run relevant unit/expression/render tests and exact ordering checks. Accept an optimization only if its target metric improves beyond run-to-run variation without unacceptable memory growth or visual/semantic differences.
+Cache the inputs or explicit revisions that determine output, rather than using camera equality alone. Placement at an unchanged camera can change visibility and variable anchors. Preserve `hasVariablePlacement`, fitted-icon output, and opacity/fade updates independently. [VertexVectorBase::updateModified](../src/mln/gfx/vertex_vector.hpp#L37) already advances timestamps only for dirty vectors; the target is the preceding unnecessary clear/append work.
 
-The [render API benchmarks](/Users/stefan/maplibre-native-stefan/benchmark/api/render.benchmark.cpp:63) use static map rendering, which takes a different placement path from continuous interaction. They are useful but insufficient for navigation frame pacing. The current [benchmark registration](/Users/stefan/maplibre-native-stefan/benchmark/CMakeLists.txt:1) also lacks direct coverage of several proposed kernels, including collision scratch reuse and large sort-key placement preparation. Any added benchmarks described above are proposed follow-up work; none were added or executed in this review.
+Backend benefit differs: [GL](../src/mln/gl/upload_pass.cpp#L105) uploads dirty shared vertices, while the current [Vulkan path](../src/mln/vulkan/upload_pass.cpp#L76) replaces changed shared vertex buffers. Metal may suppress an identical full-buffer replacement after a byte comparison. Avoiding generation can therefore save CPU even where actual transfer bytes are unchanged.
 
-**Existing optimizations that limit the opportunity**
+Validation: line labels, variable anchors, vertical writing, and icon-text-fit with moving and stationary cameras. Count glyphs regenerated, CPU writes, temporary allocations, and actual backend bytes/allocations. Exercise placement changes, bucket arrivals, hidden/oriented symbols, fading, zoom-dependent sizes, and world wraps. An idle map provides no redraws to optimize.
 
-The review explicitly accounted for style dependency guards, layout grouping, placement throttling, cached Y-sorted tiles within a source preparation, line/circle drawable reuse, dirty vertex timestamps, consolidated UBOs, backend byte-comparison guards, and shared raster textures. These are reasons to make targeted changes rather than assuming all visible loops or update calls imply redundant GPU work. No blanket container replacement, placement-quality reduction, shader rewrite, or threading expansion is recommended without a profile showing that it addresses the dominant cost.
+**6. Reuse uniform staging and compute shared values fewer times**
+
+Evidence: [SymbolLayerTweaker::execute](../src/mln/renderer/layers/symbol_layer_tweaker.cpp#L92) constructs two drawable-count-sized vectors in consolidated-UBO builds, then repeats matrices, size evaluations, and interpolation factors per drawable. Text/halo pairs and multiple segments can share many inputs. [FillLayerTweaker](../src/mln/renderer/layers/fill_layer_tweaker.cpp#L60) has the same staging pattern and computes pattern values before selecting the fill variant.
+
+Separate three small hypotheses: retain staging-vector capacity; move pattern-only work into pattern variants; reuse common calculations within the current frame and matching tile/bucket/variant. Start with these before introducing cross-frame uniform caching. Reusing capacity removes allocation, not the cost of populating or uploading uniforms. Rewrite all consumed fields and keep padding/unused union bytes deterministic; size uploads and UBO indices to the current drawable set, not retained capacity.
+
+[LayerTweaker::getTileMatrix](../src/mln/renderer/layer_tweaker.cpp#L46) rebuilds the tile transform and projection product, but a universal tile-ID-only cache is invalid. Translation/anchor, origin, alignment, projection choice, 3D/depth mode, and [layer/sublayer depth offsets](../src/mln/renderer/layer_tweaker.cpp#L91) matter. Prefer caching a common intermediate or narrowly matching drawables.
+
+[UBO consolidation](../include/mln/shaders/layer_ubo.hpp#L73) already exists for Metal/Vulkan/WebGPU, and paint UBOs have `propertiesUpdated` guards. [GL](../src/mln/gl/uniform_buffer_gl.cpp#L129), [Metal](../src/mln/mtl/buffer_resource.cpp#L98), and [Vulkan](../src/mln/vulkan/buffer_resource.cpp#L198) also compare content in their buffer-update paths. Do not count existing batching or equality checks as new savings.
+
+Validation: staging allocations and matrix/size evaluations per frame, plus CPU time and actual uniform writes. Cover solid/pattern fills, outlines, text/icon/halo combinations, depth ordering, drawable-count changes, and style transitions. Measure retained memory after an unusually large frame.
+
+**7. Share tile-cover calculations while continuing tile lifecycle work**
+
+Evidence: after its non-rendering-source early return, [TilePyramid::update](../src/mln/renderer/tile_pyramid.cpp#L94) derives ideal/prefetch arguments and calls `util::tileCover` for each eligible rendering source. Compatible sources can request identical covers within one update; stationary-camera redraws can repeat them across updates.
+
+Start with reuse within one render update for identical effective arguments. Key by the actual cover inputs: transform/viewport, ideal or prefetch zoom, zoom range, overscaled zoom, and LOD parameters. Source type, tile size, and zoom shift affect the derived arguments; matching just camera and nominal zoom is insufficient. Keep the cached result immutable, including when Tile mode truncates a consumer's cover. Consider cross-frame retention only after measuring this smaller change.
+
+Reuse only the geometric cover. Continue tile-arrival reconciliation, parent/child retention, expiry/necessity updates, relayout, cache processing, and fades. Equal camera parameters do not imply an unchanged tile lifecycle.
+
+Validation: compatible/incompatible sources, high pitch, resize, wrap jumps, overzoom, prefetch/LOD changes, and fixed-camera tile arrivals. Count cover calls per unique argument set and time cover generation separately from reconciliation. Use [tile-cover benchmarks](../benchmark/util/tilecover.benchmark.cpp) for kernel cost and a continuous-mode trace for frame impact.
+
+**8. Retain heatmap composite resources and image-source drawables**
+
+Evidence: [RenderHeatmapLayer::update](../src/mln/renderer/layers/render_heatmap_layer.cpp#L358) clears composite drawables each update, rebuilds the fullscreen-quad drawable, and creates a color-ramp texture. Its [256 × 1 ramp](../src/mln/renderer/layers/render_heatmap_layer.cpp#L39) is small; the main hypothesis is object/resource overhead.
+
+Retain the composite drawable and ramp texture. Track ramp content changes explicitly: [updateColorRamp](../src/mln/renderer/layers/render_heatmap_layer.cpp#L99) mutates the existing image, and [global-state changes](../src/mln/renderer/layers/render_heatmap_layer.cpp#L61) can trigger it. Image-pointer equality alone cannot detect a changed ramp. Rebind on render-target changes and preserve resize/style lifecycles. Density rendering remains necessary when its inputs change; its target is already half viewport width/height.
+
+Separately, the [image-data branch of RenderRasterLayer](../src/mln/renderer/layers/render_raster_layer.cpp#L237) clears and rebuilds drawables for all image matrices every update. Retain them while updating transformations; recreate for geometry/bucket/wrap-instance changes. [setTextures](../src/mln/renderer/layers/render_raster_layer.cpp#L159) already shares `bucket.texture2d`, so this finding does not imply a fresh source-image upload for every matrix.
+
+Implement and measure these independently. Validation: camera animation, ramp/global-state/intensity changes, image content/coordinates/resampling, viewport resize, wrapping, and source removal. After warmup, stable composite/image geometry should create no new drawables, and an unchanged ramp should create no new textures. Compare pixels and resource counts; these changes do not address fragment-bound heatmaps.
+
+**Implementation sequence and acceptance evidence**
+
+| Workload | First concrete change | Evidence to require |
+| --- | --- | --- |
+| Multiple populated sources | 3: one final renderability pass | Remove/add pairs disappear; render-tree CPU improves |
+| Many symbol sort-key ranges | 4: append then stable list sort | Identical ordering; preparation scales near R log R |
+| Fill/raster-heavy camera motion | 1: retain metadata on existing drawables | Attribute/segment/VAO churn drops without stale paint or masks |
+| Dense-label placement spikes | 2: caller-owned duplicate scratch | Fewer allocations and lower placement tail latency |
+| Repeated symbol-buffer work | 5: vertical-only branch, then unchanged-camera paths | Fewer glyph writes; placement/fades remain correct |
+| Remaining per-frame CPU | 6, then 7 if traces identify them | Lower staging/matrix/cover CPU with bounded retained memory |
+| Heatmap/image overlays | 8, as independent patches | Stable drawable/texture counts after warmup |
+
+**Establishing a reproducible baseline**
+
+Use two complementary baselines: an optimized host run for quick core regressions, and an on-device run for actual mobile frame pacing. Compare before/after on the same device and backend; macOS Metal, iOS Metal, Android OpenGL, and Android Vulkan are separate result series. Simulator/emulator results are useful for harness validation, not mobile performance claims.
+
+Inventory checked on 2026-10-05: this is an arm64 macOS host with Xcode 27.0, CMake, Ninja, Bazel/Bazelisk, and ADB available. `xcrun xctrace list devices` reported the host and simulators, with no physical iOS device; `adb devices -l` reported no Android devices. Recheck after connecting/unlocking a device and enabling its development access. The existing `build-macos-metal` is Debug. Android's [Versions.kt](../platform/android/buildSrc/src/main/kotlin/Versions.kt) requests NDK `28.2.13676358` and CMake `3.24.0+`; neither was present in the inspected Android SDK installation, so resolve those SDK prerequisites before building. No performance run or build was executed during this inventory; the recipes below are source-checked instructions.
+
+| Existing infrastructure | Reuse it for | Limits to preserve in the report |
+| --- | --- | --- |
+| [Host C++ benchmark runner](../platform/macos/macos.cmake#L102), [Google Benchmark options](../vendor/benchmark/docs/user_guide.md) | Offline render regression tests and tile-cover kernels; JSON and repeated runs already supported | Render API tests use `MapMode::Static` and headless image readback; repetition statistics are not per-frame percentiles |
+| [GLFW benchmark mode](../platform/glfw/glfw_view.cpp#L1158) | Continuous fixed-camera redraws with a chosen style; host CPU profiling | Re-invalidates continuously and reduces pacing limits; printed “fps” is derived from CPU render-call duration, not presentation rate; no general camera-replay CLI |
+| [Android BenchmarkActivity](../platform/android/MapLibreAndroidTestApp/src/main/java/org/maplibre/android/testapp/activity/benchmark/BenchmarkActivity.kt#L172) and [instrumentation test](../platform/android/MapLibreAndroidTestApp/src/androidTest/java/org/maplibre/android/benchmark/Benchmark.kt) | Camera tour on a real `MapView` using TextureView; separate synchronous/asynchronous runs; JSON results | Defaults use remote styles; exports means and slowest-1% means, not raw frames or p50/p95/p99 |
+| [iOS BenchmarkApp](../platform/ios/BUILD.bazel#L232) and [controller](../platform/ios/benchmark/MBXBenchViewController.mm#L103) | Continuous-mode core rendering on a physical Metal device, with per-location averages | Headless frontend with synchronous flushing and per-frame image readback/display; not normal `MLNMapView` presentation |
+
+**Common measurement contract**
+
+Before taking baseline A, freeze the harness and inputs that will also run against candidate B. Use optimized builds with matching symbols, compiler/NDK, feature flags, and validation settings. Keep debuggers, collision visualization, rendered-feature capture, and heavyweight allocation recording out of the headline timing run; collect diagnostic traces separately with the same instrumentation on A and B.
+
+Save each run under an artifact directory such as `perf-results/<revision>/<device>/<backend>/<scenario>/<run>/`. Include the full commit SHA and dirty patch/build identifier, build command/configuration, executable/APK and matching symbols, OS/GPU/driver, viewport/pixel ratio/refresh rate, style and asset hashes, camera schedule, cache state, swap mode, power/thermal state, profiler configuration, raw output, and a screenshot confirming the scene. A Git SHA alone does not identify an uncommitted fix.
+
+Use bundled assets or a frozen local tile/style/glyph/sprite server. Warm the complete route before the warm-cache measurement; a style-loaded callback alone does not establish that all route tiles are ready. Keep cold tile-arrival runs separate. Reject runs with missing assets, failed styles, altered viewport, or thermal throttling instead of averaging them into the result.
+
+For the targeted traces, start with one warmup and at least five comparable 30–60-second measured windows per build, alternating A/B order across runs and allowing the device to cool. Existing longer benchmarks can retain their own schedule. Fix camera changes to a reproducible time schedule; for a kernel workload, use a fixed operation count. Avoid an unconstrained “advance camera once per rendered frame” loop, which changes the workload when a fix increases FPS.
+
+Record per-frame renderer CPU elapsed time, placement duration/count, presented-frame deadline misses, allocations/resource counts, and peak/steady memory. Keep placement-running and placement-reusing frames separate. **RenderingStats.renderingTime is not GPU execution time:** [the implementation](../src/mln/renderer/renderer_impl.cpp#L460) measures CPU wall time around `encoder->present`; `encodingTime` is the remaining elapsed render-tree time. Both are seconds in core and are converted to milliseconds by the Android benchmark. They can include waits and are not CPU utilization counters. For a combined renderer elapsed-time distribution, sum the two values for each frame before calculating percentiles; do not add their separate p95/p99 values. Measure GPU execution/presentation independently with platform tools.
+
+**Host: first baseline without a new harness**
+
+Run from the repository root. Reuse the [macOS preset](../CMakePresets.json), but override its Debug default in a separate build directory:
+
+```sh
+cmake --preset macos-metal -B build-perf-macos-metal \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DMLN_USE_TRACY=OFF -DMLN_WITH_CLANG_TIDY=OFF -DMLN_WITH_COVERAGE=OFF
+cmake --build build-perf-macos-metal \
+  --target mbgl-benchmark-runner mbgl-glfw -j 8
+mkdir -p perf-results/baseline/host-metal
+build-perf-macos-metal/mbgl-benchmark-runner --benchmark_list_tests=true
+build-perf-macos-metal/mbgl-benchmark-runner \
+  --benchmark_filter='^(TileCoverPitchedViewport|API_renderStill_reuse_map|API_renderStill_multiple_sources)(/|$)' \
+  --benchmark_repetitions=7 --benchmark_min_warmup_time=2 \
+  --benchmark_out=perf-results/baseline/host-metal/kernels.json \
+  --benchmark_out_format=json
+```
+
+The [render fixtures](../benchmark/api/render.benchmark.cpp#L24) already use a local cache database and disable networking. Run with the repository as the working directory. The multiple-source fixture has empty added sources: it exercises layer scans, not populated drawable-group churn. The tile-cover fixture measures the kernel, not the cross-source saving in finding 7. Repeated benchmark measurements report variability of iteration averages; they do not establish navigation p99.
+
+For continuous fixed-camera redraws, supply a frozen style whose complete resources are already local/cached, keep the window dimensions constant, and leave it focused:
+
+```sh
+build-perf-macos-metal/platform/glfw/mbgl-glfw \
+  --style file:///absolute/path/to/frozen-style.json \
+  --cache /absolute/path/to/frozen-cache.db --offline --benchmark \
+  --lon=-73.992857 --lat=40.726989 --zoom=15 --bearing=0 --pitch=45 \
+  2>&1 | tee perf-results/baseline/host-metal/redraw.log
+```
+
+The paths above are inputs to prepare, not fixtures created by this review. After warmup, capture a consistent interval; stop the app after the run. GLFW's [one-second reports](../platform/glfw/glfw_view.cpp#L1245) are useful smoke measurements, but retain a trace or add raw-frame output before claiming percentiles. Benchmark mode deliberately forces redraws; it is useful for findings 1/5/6/8 and must be labeled as such.
+
+The installed Instruments templates include Time Profiler, Allocations, Game Performance, and Metal System Trace. Attach to the warmed process using its PID:
+
+```sh
+xcrun xctrace record --template 'Time Profiler' --time-limit 30s \
+  --attach PID --output perf-results/baseline/host-metal/cpu.trace
+```
+
+Capture allocations and GPU behavior in separate runs. Use [Apple's Metal performance workflow](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app/) for CPU/GPU overlap and presentation. The repository's Tracy integration should not be assumed to work unchanged on Metal: its [instrumentation header](../include/mln/util/instrumentation.hpp#L28) currently requires an OpenGL/Vulkan backend define. Instruments is the host/iOS starting point here. The `macos-vulkan` preset is an optional MoltenVK comparison when installed; it does not reproduce an Android Vulkan driver.
+
+Repeat the same commands against the fix with a different output directory. The vendored [compare.py](../vendor/benchmark/tools/compare.py) can compare Google Benchmark JSON after installing its adjacent Python requirements; keep individual repetitions, not only the aggregate rows.
+
+**Android: reuse the existing camera-tour benchmark**
+
+Connect a physical phone, enable USB debugging, approve the host, and select the serial from `adb devices -l`. Use the [Android build setup](mdbook/src/platforms/android/README.md) and required SDK/NDK versions. Override the benchmark styles through `MapLibreAndroidTestApp/src/main/res/values/developer-config.xml`, using the `benchmark_style_names` / `benchmark_style_urls` arrays shown in the [existing benchmark guide](mdbook/src/platforms/android/benchmark.md). Pin resources too; merely pinning a URL does not freeze its contents. For a host-local HTTP fixture server, `adb reverse tcp:PORT tcp:PORT` can expose it as device localhost, subject to the app's network configuration.
+
+Build both real backend flavors using the [CI recipe](../.github/workflows/android-ci.yml#L141). From `platform/android`:
+
+```sh
+./gradlew :MapLibreAndroidTestApp:assembleOpenglRelease \
+  :MapLibreAndroidTestApp:assembleOpenglReleaseAndroidTest \
+  :MapLibreAndroidTestApp:assembleVulkanRelease \
+  :MapLibreAndroidTestApp:assembleVulkanReleaseAndroidTest \
+  -PtestBuildType=release -Pmaplibre.abis=arm64-v8a
+```
+
+Install and run one backend at a time; both use the same application ID. Substitute the actual serial. Commands below remain in `platform/android`:
+
+```sh
+PERF_ANDROID_SERIAL=DEVICE_SERIAL
+mkdir -p ../../perf-results/baseline/android-opengl
+adb -s "$PERF_ANDROID_SERIAL" install -r \
+  MapLibreAndroidTestApp/build/outputs/apk/opengl/release/MapLibreAndroidTestApp-opengl-release.apk
+adb -s "$PERF_ANDROID_SERIAL" install -r \
+  MapLibreAndroidTestApp/build/outputs/apk/androidTest/opengl/release/MapLibreAndroidTestApp-opengl-release-androidTest.apk
+adb -s "$PERF_ANDROID_SERIAL" shell am instrument -w -r \
+  -e class org.maplibre.android.benchmark.Benchmark \
+  org.maplibre.android.testapp.test/org.maplibre.android.InstrumentationRunner \
+  > ../../perf-results/baseline/android-opengl/instrumentation.txt
+adb -s "$PERF_ANDROID_SERIAL" exec-out run-as org.maplibre.android.testapp \
+  cat files/benchmark_results.json \
+  > ../../perf-results/baseline/android-opengl/benchmark_results.json
+```
+
+For Vulkan, use the `vulkan` APK paths and a separate `android-vulkan` output directory. Verify that results contain the intended `renderer`, revision, timestamp, positive FPS, and valid timings, and that instrumentation reports a successful test; an old JSON file can survive a failed run. `run-as` requires a debuggable installed app: the [source manifest](../platform/android/MapLibreAndroidTestApp/src/main/AndroidManifest.xml#L8) sets it, but verify the merged Release APK rather than inferring it from `BuildConfig.DEBUG`. If extraction is denied, preserve the already-printed JSON from logcat or add an instrumentation-owned result export/test attachment. Use the same optimized test packaging on both sides; switching only one side to Debug invalidates the comparison.
+
+The [current schedule](../platform/android/MapLibreAndroidTestApp/src/main/java/org/maplibre/android/testapp/activity/benchmark/BenchmarkActivity.kt#L177) is four locations, two swap modes, one discarded 15-second-per-leg warmup, and three recorded 70-second-per-leg tours. That is roughly **30 minutes per style per backend**, plus loading. Start with one representative style. Keep `syncRendering=true` and `false` results separate; they measure different synchronization behavior.
+
+Interpret the existing output carefully. [FrameTimeStore.low1p](../platform/android/MapLibreAndroidTestApp/src/main/java/org/maplibre/android/testapp/utils/BenchmarkUtils.kt#L95) averages the slowest 1% of samples; it is not p99. The [listener](../platform/android/MapLibreAndroidTestApp/src/main/java/org/maplibre/android/testapp/activity/benchmark/BenchmarkActivity.kt#L219) starts before style loading and only resets the FPS counter afterwards, so timing arrays include startup frames while FPS uses the tour interval. Keep those metrics as legacy summaries until the small measurement-window change described below is made consistently to A and B.
+
+For frame deadlines and scheduling, capture an [Android Studio system trace](https://developer.android.com/studio/profile/cpu-profiler) or Perfetto during the same tour. [FrameTimeline](https://perfetto.dev/docs/data-sources/frametimeline) requires Android 12+ and documents SurfaceView limitations; this benchmark uses TextureView, but still inspect which app/surface frames are represented. For GPU diagnosis use [AGI on supported devices](https://developer.android.com/agi/start). Its OpenGL frame-capture mode uses ANGLE, so an ANGLE capture must not replace the native OpenGL timing baseline.
+
+For core attribution, reuse [Tracy](mdbook/src/profiling/tracy-profiling.md): pass `-DMLN_USE_TRACY=ON` through the shared native CMake arguments in [NativeBuildPlugin.kt](../platform/android/buildSrc/src/main/kotlin/NativeBuildPlugin.kt), ensure `TRACY_ON_DEMAND` is defined consistently for the core and Tracy client, and forward `adb -s "$PERF_ANDROID_SERIAL" forward tcp:8086 tcp:8086`. No ready-made Gradle Tracy property was found. Preserve the client/server version: [vendor/tracy.cmake](../vendor/tracy.cmake#L10) currently fetches `master`. Existing zones cover render-tree creation, source/layer preparation, and placement; add narrow zones only where these cannot isolate the proposed change. The current GPU-zone integration is OpenGL-only; Vulkan CPU zones do not supply Vulkan GPU timing.
+
+**iOS: reuse BenchmarkApp, then validate normal presentation**
+
+Use a physical iPhone/iPad for performance and a simulator only to verify setup. Follow the [iOS signing/Bazel guide](mdbook/src/platforms/ios/README.md), including a local bundle prefix and development team. From the repository root:
+
+```sh
+bazel run //platform/ios:xcodeproj \
+  --@rules_xcodeproj//xcodeproj:extra_common_flags="--//:renderer=metal"
+xed platform/ios/MapLibre.xcodeproj
+```
+
+Select the generated `BenchmarkApp` scheme and physical device, explicitly use **Release** for Run/Profile, and preserve symbols. The [project defaults to Debug](../platform/ios/BUILD.bazel#L267). Record the selected scheme/configuration and resolved build settings. For a scripted build after signing is configured:
+
+```sh
+PERF_IOS_UDID=DEVICE_UDID
+xcodebuild -project platform/ios/MapLibre.xcodeproj -scheme BenchmarkApp \
+  -configuration Release -destination "id=$PERF_IOS_UDID" \
+  -derivedDataPath build-perf-ios build
+```
+
+Run from Xcode without the debugger attached, or install the resulting `.app` through `xcrun devicectl device install app --device "$PERF_IOS_UDID" /path/to/BenchmarkApp.app` and launch its configured bundle ID. Save the app's console output. Optional `LOG_TO_DOCUMENTS_DIR` support already exists in the controller, but is not enabled by the current Bazel target; a structured JSON/CSV export would be a small follow-up. The old `bench_UITests.swift` and `benchmark/ios` wrapper sources are not current top-level benchmark test targets in the inspected Bazel project, so do not assume `xcodebuild test` automatically runs them.
+
+The controller selects a [bundled local style](../platform/ios/benchmark/MBXBenchViewController.mm#L77) only when its tile sentinel exists; otherwise it falls back to MapTiler. Verify the logged style and freeze the bundled assets. It waits for `isFullyLoaded`, then measures five seconds per location, emitting average encoding/present timings. However, `easeTo` starts **before** that loading wait, so variable loading can consume different parts of the animation. Its [readback/image display](../platform/ios/benchmark/MBXBenchViewController.mm#L197) also changes GPU synchronization and wall-clock pacing. Use these results as a labeled core stress baseline, then repeat the same scene/route in the existing iOS `App`/`MLNMapView` for user-visible performance.
+
+Use Product → Profile with Time Profiler for CPU attribution and Game Performance/Metal System Trace for presentation and GPU work. A repeatable attachment to an already-running benchmark is:
+
+```sh
+mkdir -p perf-results/baseline/ios-metal
+xcrun xctrace record --template 'Time Profiler' --device "$PERF_IOS_UDID" \
+  --attach BenchmarkApp --time-limit 30s \
+  --output perf-results/baseline/ios-metal/cpu.trace
+```
+
+Select the same measured phase in both traces; whole-app startup profiles are not steady-state frame measurements. The SDK sample already receives [frame stats](../platform/ios/app/MBXViewController.mm#L3050), providing an existing hook for raw samples. iOS validates shared-core and Metal effects; it cannot substitute for Android GL/Vulkan measurements.
+
+**Small additions needed for decision-quality comparisons**
+
+Extend the existing apps and benchmark runner before building a new framework. Put any harness changes in both A and B before recording the baseline:
+
+- Add explicit warmup/measure phase markers, a configurable camera schedule, and raw-frame CSV/JSON output using existing frame callbacks. On Android, reset both timing stores after warmup; on iOS, start the measured camera transition after assets are ready. Buffer records in memory and write after the timed window. Include frame/phase IDs and placement-running status where available.
+- Add short, frozen scenarios that the world tours do not cover: populated multi-source fills/rasters for 1/3/7; dense line/variable-anchor labels with sort keys and rotation/pitch for 2/4; stationary camera plus unrelated paint animation and vertical writing for 5; many outlines/halos for 6; heatmap/image overlays for 8. Reuse GLFW forced redraws for host screening, then test a real redraw trigger on phones.
+- Add allocation-free counters or narrow trace zones for attribute/segment/VAO construction, collision duplicate tracking, placement-order construction, dynamic glyph writes, uniform staging/matrix evaluations, and cover calls. RenderingStats already supplies resource counters, but some count update attempts rather than physical transfers. Collect allocation call stacks in a separate diagnostic run.
+- Add only missing kernels to the existing Google Benchmark target: collision queries and sort-key preparation currently have no direct benchmark. Vary candidate/range counts and verify identical results outside timed sections. A kernel speedup is supporting evidence; require the device trace to show that it reduces the targeted frame/placement cost.
+
+Existing [Android device CI](../.github/workflows/android-device-test.yml#L45) already consumes benchmark APKs and stores JSON through the [collection](../scripts/aws-device-farm/collect-benchmark-outputs.mjs) and [database](../scripts/aws-device-farm/update-benchmark-db.mjs) scripts. Its benchmark job currently selects OpenGL; Vulkan render-test coverage is not a Vulkan performance baseline. Use that pipeline for broader device coverage after local A/B results, if access is available. The older [run-benchmark.sh](../platform/android/scripts/run-benchmark.sh) still references the removed `legacy` flavor, and the plot script expects older renderer names; use the current Gradle flavors/JSON and adapt reporting before reuse. No cloud runs are required to establish the first baseline.
+
+**Comparing A and B**
+
+For each identical device/backend/style/phase/swap-mode group, compute per-run p50/p95/p99 from raw frames, then compare the distribution of run summaries. Keep the existing Android slowest-1% mean separately named. Report `saved_ms = baseline_ms − candidate_ms` and `saved_percent = 100 × saved_ms / baseline_ms`, alongside frame count, deadline-miss rate, placement frequency, and memory. Never derive p99 from average FPS or average per-run p99 values into a claimed pooled percentile.
+
+First repeat A against A to establish noise. Accept a fix only when the A/B effect exceeds that variation across repeated runs, the intended operation counts decrease, and matching render tests/pixels and ordering remain correct. Report unchanged FPS as such if the gain is CPU headroom under a frame cap. Preserve raw artifacts and failures; do not sum the scenario estimates above or extrapolate host milliseconds to phones. Replace those assumptions with measured before/after results as fixes land.
+
+Existing style-dependency guards, layout grouping, placement throttling, per-source Y-sorted tile reuse, line/circle drawable retention, dirty vertex timestamps, UBO consolidation, buffer comparisons, and shared raster textures constrain the opportunity. The proposed work preserves those mechanisms and targets redundant CPU work around them.
